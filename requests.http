@@ -1,0 +1,39 @@
+### Happy path (all fields have defaults)
+POST http://localhost:3000/shipments
+Content-Type: application/json
+
+{
+  "customerId": "acme-gmbh",
+  "containers": 2,
+  "containerType": "40HC",
+  "originPort": "CNSHA",
+  "destinationPort": "NLRTM",
+  "finalDestinationCity": "Duisburg",
+  "cargoDescription": "Solar panels",
+  "hsCode": "854143",
+  "cargoValueEur": 120000
+}
+
+### Fails at the warehouse, compensates trucking, customs, ocean
+POST http://localhost:3000/shipments
+Content-Type: application/json
+
+{ "finalDestinationCity": "Berlin" }
+
+### Force a failure / timeout / flaky compensation anywhere
+POST http://localhost:3000/shipments
+Content-Type: application/json
+
+{ "simulate": { "failAt": "billing", "slowReplyAt": "customs", "flakyCompensationAt": "ocean-carrier" } }
+
+### List sagas
+GET http://localhost:3000/shipments
+
+### One saga with its timeline (replace the id)
+GET http://localhost:3000/shipments/00000000-0000-0000-0000-000000000000
+
+### What each participant's own DB holds for that saga
+GET http://localhost:3000/shipments/00000000-0000-0000-0000-000000000000/participants
+
+### Retry a COMPENSATION_FAILED saga
+POST http://localhost:3000/shipments/00000000-0000-0000-0000-000000000000/retry-compensation

@@ -1,0 +1,7 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "outDir": "../../dist/apps/ocean-carrier"
+  },
+  "include": ["src/**/*", "../../libs/common/src/**/*"]
+}

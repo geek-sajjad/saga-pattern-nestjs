@@ -1,0 +1,41 @@
+{
+  "name": "saga-pattern",
+  "version": "1.0.0",
+  "private": true,
+  "description": "NestJS microservices demo of the orchestrated SAGA pattern (freight forwarding)",
+  "scripts": {
+    "build": "nest build orchestrator && nest build ocean-carrier && nest build customs && nest build trucking && nest build warehouse && nest build billing",
+    "start:orchestrator": "nest start orchestrator --watch",
+    "start:ocean-carrier": "nest start ocean-carrier --watch",
+    "start:customs": "nest start customs --watch",
+    "start:trucking": "nest start trucking --watch",
+    "start:warehouse": "nest start warehouse --watch",
+    "start:billing": "nest start billing --watch",
+    "start:participants": "concurrently -n ocean,customs,truck,wh,bill -c blue,magenta,yellow,cyan,green \"npm:start:ocean-carrier\" \"npm:start:customs\" \"npm:start:trucking\" \"npm:start:warehouse\" \"npm:start:billing\"",
+    "start:all": "concurrently -n orch,ocean,customs,truck,wh,bill -c white.bold,blue,magenta,yellow,cyan,green \"npm:start:orchestrator\" \"npm:start:ocean-carrier\" \"npm:start:customs\" \"npm:start:trucking\" \"npm:start:warehouse\" \"npm:start:billing\"",
+    "db:reset": "rm -rf data/*.sqlite"
+  },
+  "dependencies": {
+    "@nestjs/common": "^12.1.1",
+    "@nestjs/core": "^12.1.1",
+    "@nestjs/microservices": "^12.1.1",
+    "@nestjs/platform-express": "^12.1.1",
+    "@nestjs/typeorm": "^12.0.2",
+    "better-sqlite3": "^12.11.1",
+    "class-transformer": "^0.5.1",
+    "class-validator": "^0.15.1",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.2",
+    "typeorm": "^1.1.1"
+  },
+  "devDependencies": {
+    "@nestjs/cli": "^12.0.8",
+    "@types/express": "^5.0.6",
+    "@types/node": "^26.6.3",
+    "concurrently": "^10.0.5",
+    "typescript": "~6.0.2"
+  },
+  "allowScripts": {
+    "better-sqlite3@12.11.1": true
+  }
+}
