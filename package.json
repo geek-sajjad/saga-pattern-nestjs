@@ -4,7 +4,7 @@
   "private": true,
   "description": "NestJS microservices demo of the orchestrated SAGA pattern (freight forwarding)",
   "scripts": {
-    "build": "nest build orchestrator && nest build ocean-carrier && nest build customs && nest build trucking && nest build warehouse && nest build billing",
+    "build": "nest build orchestrator && nest build ocean-carrier && nest build customs && nest build trucking && nest build warehouse && nest build billing && nest build bpmn-engine",
     "start:orchestrator": "nest start orchestrator --watch",
     "start:ocean-carrier": "nest start ocean-carrier --watch",
     "start:customs": "nest start customs --watch",
@@ -13,6 +13,7 @@
     "start:billing": "nest start billing --watch",
     "start:participants": "concurrently -n ocean,customs,truck,wh,bill -c blue,magenta,yellow,cyan,green \"npm:start:ocean-carrier\" \"npm:start:customs\" \"npm:start:trucking\" \"npm:start:warehouse\" \"npm:start:billing\"",
     "start:all": "concurrently -n orch,ocean,customs,truck,wh,bill -c white.bold,blue,magenta,yellow,cyan,green \"npm:start:orchestrator\" \"npm:start:ocean-carrier\" \"npm:start:customs\" \"npm:start:trucking\" \"npm:start:warehouse\" \"npm:start:billing\"",
+    "start:bpmn": "nest start bpmn-engine --watch",
     "db:reset": "rm -rf data/*.sqlite"
   },
   "dependencies": {
@@ -24,6 +25,7 @@
     "better-sqlite3": "^12.11.1",
     "class-transformer": "^0.5.1",
     "class-validator": "^0.15.1",
+    "fast-xml-parser": "^5.11.2",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.2",
     "typeorm": "^1.1.1"

@@ -1,0 +1,256 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
+                  xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
+                  xmlns:di="http://www.omg.org/spec/DD/20100524/DI"
+                  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                  xmlns:mini="https://example.com/mini-bpmn"
+                  id="Definitions_shipment-saga" targetNamespace="https://example.com/mini-bpmn">
+  <bpmn:error id="Error_Rejected" name="Booking rejected" errorCode="BOOKING_REJECTED" />
+  <bpmn:process id="shipment-saga" name="Shipment saga" isExecutable="true">
+    <bpmn:startEvent id="Start_Shipment" name="Shipment ordered">
+      <bpmn:outgoing>Flow_ToOcean</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:serviceTask id="Task_Ocean" name="Book vessel slots" mini:handler="ocean.book">
+      <bpmn:incoming>Flow_ToOcean</bpmn:incoming>
+      <bpmn:outgoing>Flow_ToCustoms</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:boundaryEvent id="Err_Ocean" attachedToRef="Task_Ocean">
+      <bpmn:outgoing>Flow_ErrOcean</bpmn:outgoing>
+      <bpmn:errorEventDefinition id="ErrDef_Ocean" errorRef="Error_Rejected" />
+    </bpmn:boundaryEvent>
+    <bpmn:boundaryEvent id="Comp_Ocean" attachedToRef="Task_Ocean">
+      <bpmn:compensateEventDefinition id="CompDef_Ocean" />
+    </bpmn:boundaryEvent>
+    <bpmn:serviceTask id="Undo_Ocean" name="Cancel ocean booking" isForCompensation="true" mini:handler="ocean.cancel" />
+    <bpmn:association id="Assoc_Ocean" associationDirection="One" sourceRef="Comp_Ocean" targetRef="Undo_Ocean" />
+    <bpmn:serviceTask id="Task_Customs" name="File import declaration" mini:handler="customs.file">
+      <bpmn:incoming>Flow_ToCustoms</bpmn:incoming>
+      <bpmn:outgoing>Flow_ToTrucking</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:boundaryEvent id="Err_Customs" attachedToRef="Task_Customs">
+      <bpmn:outgoing>Flow_ErrCustoms</bpmn:outgoing>
+      <bpmn:errorEventDefinition id="ErrDef_Customs" errorRef="Error_Rejected" />
+    </bpmn:boundaryEvent>
+    <bpmn:boundaryEvent id="Comp_Customs" attachedToRef="Task_Customs">
+      <bpmn:compensateEventDefinition id="CompDef_Customs" />
+    </bpmn:boundaryEvent>
+    <bpmn:serviceTask id="Undo_Customs" name="Withdraw declaration" isForCompensation="true" mini:handler="customs.withdraw" />
+    <bpmn:association id="Assoc_Customs" associationDirection="One" sourceRef="Comp_Customs" targetRef="Undo_Customs" />
+    <bpmn:serviceTask id="Task_Trucking" name="Book trucks" mini:handler="trucking.book">
+      <bpmn:incoming>Flow_ToTrucking</bpmn:incoming>
+      <bpmn:outgoing>Flow_ToWarehouse</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:boundaryEvent id="Err_Trucking" attachedToRef="Task_Trucking">
+      <bpmn:outgoing>Flow_ErrTrucking</bpmn:outgoing>
+      <bpmn:errorEventDefinition id="ErrDef_Trucking" errorRef="Error_Rejected" />
+    </bpmn:boundaryEvent>
+    <bpmn:boundaryEvent id="Comp_Trucking" attachedToRef="Task_Trucking">
+      <bpmn:compensateEventDefinition id="CompDef_Trucking" />
+    </bpmn:boundaryEvent>
+    <bpmn:serviceTask id="Undo_Trucking" name="Cancel truck order" isForCompensation="true" mini:handler="trucking.cancel" />
+    <bpmn:association id="Assoc_Trucking" associationDirection="One" sourceRef="Comp_Trucking" targetRef="Undo_Trucking" />
+    <bpmn:serviceTask id="Task_Warehouse" name="Reserve warehouse space" mini:handler="warehouse.reserve">
+      <bpmn:incoming>Flow_ToWarehouse</bpmn:incoming>
+      <bpmn:outgoing>Flow_ToBilling</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:boundaryEvent id="Err_Warehouse" attachedToRef="Task_Warehouse">
+      <bpmn:outgoing>Flow_ErrWarehouse</bpmn:outgoing>
+      <bpmn:errorEventDefinition id="ErrDef_Warehouse" errorRef="Error_Rejected" />
+    </bpmn:boundaryEvent>
+    <bpmn:boundaryEvent id="Comp_Warehouse" attachedToRef="Task_Warehouse">
+      <bpmn:compensateEventDefinition id="CompDef_Warehouse" />
+    </bpmn:boundaryEvent>
+    <bpmn:serviceTask id="Undo_Warehouse" name="Release warehouse space" isForCompensation="true" mini:handler="warehouse.release" />
+    <bpmn:association id="Assoc_Warehouse" associationDirection="One" sourceRef="Comp_Warehouse" targetRef="Undo_Warehouse" />
+    <bpmn:serviceTask id="Task_Billing" name="Charge customer (pivot)" mini:handler="billing.charge">
+      <bpmn:incoming>Flow_ToBilling</bpmn:incoming>
+      <bpmn:outgoing>Flow_ToEnd</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:boundaryEvent id="Err_Billing" attachedToRef="Task_Billing">
+      <bpmn:outgoing>Flow_ErrBilling</bpmn:outgoing>
+      <bpmn:errorEventDefinition id="ErrDef_Billing" errorRef="Error_Rejected" />
+    </bpmn:boundaryEvent>
+    <bpmn:boundaryEvent id="Comp_Billing" attachedToRef="Task_Billing">
+      <bpmn:compensateEventDefinition id="CompDef_Billing" />
+    </bpmn:boundaryEvent>
+    <bpmn:serviceTask id="Undo_Billing" name="Refund customer" isForCompensation="true" mini:handler="billing.refund" />
+    <bpmn:association id="Assoc_Billing" associationDirection="One" sourceRef="Comp_Billing" targetRef="Undo_Billing" />
+    <bpmn:endEvent id="End_Booked" name="Shipment booked">
+      <bpmn:incoming>Flow_ToEnd</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:intermediateThrowEvent id="Throw_Compensate" name="Undo completed bookings">
+      <bpmn:incoming>Flow_ErrOcean</bpmn:incoming>
+      <bpmn:incoming>Flow_ErrCustoms</bpmn:incoming>
+      <bpmn:incoming>Flow_ErrTrucking</bpmn:incoming>
+      <bpmn:incoming>Flow_ErrWarehouse</bpmn:incoming>
+      <bpmn:incoming>Flow_ErrBilling</bpmn:incoming>
+      <bpmn:outgoing>Flow_ToCancelled</bpmn:outgoing>
+      <bpmn:compensateEventDefinition id="CompDef_Throw" />
+    </bpmn:intermediateThrowEvent>
+    <bpmn:endEvent id="End_Cancelled" name="Shipment cancelled">
+      <bpmn:incoming>Flow_ToCancelled</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="Flow_ToOcean" sourceRef="Start_Shipment" targetRef="Task_Ocean" />
+    <bpmn:sequenceFlow id="Flow_ErrOcean" sourceRef="Err_Ocean" targetRef="Throw_Compensate" />
+    <bpmn:sequenceFlow id="Flow_ToCustoms" sourceRef="Task_Ocean" targetRef="Task_Customs" />
+    <bpmn:sequenceFlow id="Flow_ErrCustoms" sourceRef="Err_Customs" targetRef="Throw_Compensate" />
+    <bpmn:sequenceFlow id="Flow_ToTrucking" sourceRef="Task_Customs" targetRef="Task_Trucking" />
+    <bpmn:sequenceFlow id="Flow_ErrTrucking" sourceRef="Err_Trucking" targetRef="Throw_Compensate" />
+    <bpmn:sequenceFlow id="Flow_ToWarehouse" sourceRef="Task_Trucking" targetRef="Task_Warehouse" />
+    <bpmn:sequenceFlow id="Flow_ErrWarehouse" sourceRef="Err_Warehouse" targetRef="Throw_Compensate" />
+    <bpmn:sequenceFlow id="Flow_ToBilling" sourceRef="Task_Warehouse" targetRef="Task_Billing" />
+    <bpmn:sequenceFlow id="Flow_ErrBilling" sourceRef="Err_Billing" targetRef="Throw_Compensate" />
+    <bpmn:sequenceFlow id="Flow_ToEnd" sourceRef="Task_Billing" targetRef="End_Booked" />
+    <bpmn:sequenceFlow id="Flow_ToCancelled" sourceRef="Throw_Compensate" targetRef="End_Cancelled" />
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="Diagram_shipment-saga">
+    <bpmndi:BPMNPlane id="Plane_shipment-saga" bpmnElement="shipment-saga">
+      <bpmndi:BPMNShape id="Start_Shipment_di" bpmnElement="Start_Shipment">
+        <dc:Bounds x="152" y="202" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_Ocean_di" bpmnElement="Task_Ocean">
+        <dc:Bounds x="250" y="180" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Err_Ocean_di" bpmnElement="Err_Ocean">
+        <dc:Bounds x="307" y="162" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Comp_Ocean_di" bpmnElement="Comp_Ocean">
+        <dc:Bounds x="262" y="242" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Undo_Ocean_di" bpmnElement="Undo_Ocean">
+        <dc:Bounds x="250" y="330" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_Customs_di" bpmnElement="Task_Customs">
+        <dc:Bounds x="410" y="180" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Err_Customs_di" bpmnElement="Err_Customs">
+        <dc:Bounds x="467" y="162" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Comp_Customs_di" bpmnElement="Comp_Customs">
+        <dc:Bounds x="422" y="242" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Undo_Customs_di" bpmnElement="Undo_Customs">
+        <dc:Bounds x="410" y="330" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_Trucking_di" bpmnElement="Task_Trucking">
+        <dc:Bounds x="570" y="180" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Err_Trucking_di" bpmnElement="Err_Trucking">
+        <dc:Bounds x="627" y="162" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Comp_Trucking_di" bpmnElement="Comp_Trucking">
+        <dc:Bounds x="582" y="242" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Undo_Trucking_di" bpmnElement="Undo_Trucking">
+        <dc:Bounds x="570" y="330" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_Warehouse_di" bpmnElement="Task_Warehouse">
+        <dc:Bounds x="730" y="180" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Err_Warehouse_di" bpmnElement="Err_Warehouse">
+        <dc:Bounds x="787" y="162" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Comp_Warehouse_di" bpmnElement="Comp_Warehouse">
+        <dc:Bounds x="742" y="242" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Undo_Warehouse_di" bpmnElement="Undo_Warehouse">
+        <dc:Bounds x="730" y="330" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_Billing_di" bpmnElement="Task_Billing">
+        <dc:Bounds x="890" y="180" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Err_Billing_di" bpmnElement="Err_Billing">
+        <dc:Bounds x="947" y="162" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Comp_Billing_di" bpmnElement="Comp_Billing">
+        <dc:Bounds x="902" y="242" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Undo_Billing_di" bpmnElement="Undo_Billing">
+        <dc:Bounds x="890" y="330" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="End_Booked_di" bpmnElement="End_Booked">
+        <dc:Bounds x="1132" y="202" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Throw_Compensate_di" bpmnElement="Throw_Compensate">
+        <dc:Bounds x="1132" y="72" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="End_Cancelled_di" bpmnElement="End_Cancelled">
+        <dc:Bounds x="1232" y="72" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="Flow_ToOcean_di" bpmnElement="Flow_ToOcean">
+        <di:waypoint x="188" y="220" />
+        <di:waypoint x="250" y="220" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_ErrOcean_di" bpmnElement="Flow_ErrOcean">
+        <di:waypoint x="325" y="162" />
+        <di:waypoint x="325" y="90" />
+        <di:waypoint x="1132" y="90" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Assoc_Ocean_di" bpmnElement="Assoc_Ocean">
+        <di:waypoint x="280" y="278" />
+        <di:waypoint x="280" y="330" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_ToCustoms_di" bpmnElement="Flow_ToCustoms">
+        <di:waypoint x="350" y="220" />
+        <di:waypoint x="410" y="220" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_ErrCustoms_di" bpmnElement="Flow_ErrCustoms">
+        <di:waypoint x="485" y="162" />
+        <di:waypoint x="485" y="90" />
+        <di:waypoint x="1132" y="90" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Assoc_Customs_di" bpmnElement="Assoc_Customs">
+        <di:waypoint x="440" y="278" />
+        <di:waypoint x="440" y="330" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_ToTrucking_di" bpmnElement="Flow_ToTrucking">
+        <di:waypoint x="510" y="220" />
+        <di:waypoint x="570" y="220" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_ErrTrucking_di" bpmnElement="Flow_ErrTrucking">
+        <di:waypoint x="645" y="162" />
+        <di:waypoint x="645" y="90" />
+        <di:waypoint x="1132" y="90" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Assoc_Trucking_di" bpmnElement="Assoc_Trucking">
+        <di:waypoint x="600" y="278" />
+        <di:waypoint x="600" y="330" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_ToWarehouse_di" bpmnElement="Flow_ToWarehouse">
+        <di:waypoint x="670" y="220" />
+        <di:waypoint x="730" y="220" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_ErrWarehouse_di" bpmnElement="Flow_ErrWarehouse">
+        <di:waypoint x="805" y="162" />
+        <di:waypoint x="805" y="90" />
+        <di:waypoint x="1132" y="90" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Assoc_Warehouse_di" bpmnElement="Assoc_Warehouse">
+        <di:waypoint x="760" y="278" />
+        <di:waypoint x="760" y="330" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_ToBilling_di" bpmnElement="Flow_ToBilling">
+        <di:waypoint x="830" y="220" />
+        <di:waypoint x="890" y="220" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_ErrBilling_di" bpmnElement="Flow_ErrBilling">
+        <di:waypoint x="965" y="162" />
+        <di:waypoint x="965" y="90" />
+        <di:waypoint x="1132" y="90" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Assoc_Billing_di" bpmnElement="Assoc_Billing">
+        <di:waypoint x="920" y="278" />
+        <di:waypoint x="920" y="330" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_ToEnd_di" bpmnElement="Flow_ToEnd">
+        <di:waypoint x="990" y="220" />
+        <di:waypoint x="1132" y="220" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_ToCancelled_di" bpmnElement="Flow_ToCancelled">
+        <di:waypoint x="1168" y="90" />
+        <di:waypoint x="1232" y="90" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>

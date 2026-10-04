@@ -58,6 +58,13 @@
       "entryFile": "apps/billing/src/main",
       "sourceRoot": "apps/billing/src",
       "compilerOptions": { "tsConfigPath": "apps/billing/tsconfig.app.json" }
+    },
+    "bpmn-engine": {
+      "type": "application",
+      "root": "apps/bpmn-engine",
+      "entryFile": "apps/bpmn-engine/src/main",
+      "sourceRoot": "apps/bpmn-engine/src",
+      "compilerOptions": { "tsConfigPath": "apps/bpmn-engine/tsconfig.app.json" }
     }
   }
 }

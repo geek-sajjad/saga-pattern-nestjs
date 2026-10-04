@@ -1,0 +1,306 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  import-shipment: a door-to-door import, from order to invoice. It uses every feature the engine has:
+   - XOR gateway on a risk score, with a compliance review that sends a reminder after 20s (NON-interrupting timer)
+     and escalates to the head of compliance after 45s (INTERRUPTING timer);
+   - an embedded SUB-PROCESS that books ocean + warehouse in parallel, then trucks. One error boundary on the
+     sub-process catches a rejection from any booking inside it, and a compensation event undoes what was booked;
+   - a CALL ACTIVITY to customs-clearance, bound by version tag (${customsRelease}, default "2026.2").
+     CARGO_SEIZED thrown inside the called process ends up on this call activity's error boundary;
+   - a RECEIVE TASK that waits for the VesselArrived message, correlated by ${shipmentRef}; an AddressChanged
+     message updates the delivery address without interrupting the wait; a late vessel loops back to waiting;
+   - MULTI-INSTANCE activities over the containers: delivery slots are planned one after another (sequential),
+     then every container's proof of delivery is confirmed in parallel;
+   - billing as the last step: once goods are delivered there is nothing left to compensate, so a failed charge
+     goes to a person instead.
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
+                  xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
+                  xmlns:di="http://www.omg.org/spec/DD/20100524/DI"
+                  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                  xmlns:mini="https://example.com/mini-bpmn"
+                  id="Definitions_import-shipment" targetNamespace="https://example.com/mini-bpmn">
+  <bpmn:error id="Error_Rejected" name="Booking rejected" errorCode="BOOKING_REJECTED" />
+  <bpmn:error id="Error_Seized" name="Cargo seized" errorCode="CARGO_SEIZED" />
+  <bpmn:message id="Msg_VesselArrived" name="VesselArrived" mini:correlationKey="${shipmentRef}" />
+  <bpmn:message id="Msg_AddressChanged" name="AddressChanged" mini:correlationKey="${shipmentRef}" />
+  <bpmn:process id="import-shipment" name="Door-to-door import" isExecutable="true" mini:versionTag="2026.10">
+
+    <!-- ① intake and compliance -->
+    <bpmn:startEvent id="Start_Order" name="Import order received" />
+    <bpmn:serviceTask id="Task_Register" name="Register order" mini:handler="order.register" />
+    <bpmn:serviceTask id="Task_Risk" name="Screen parties &amp; score risk" mini:handler="risk.score" />
+    <bpmn:exclusiveGateway id="Gw_Risk" name="Risk?" default="Flow_Low" />
+    <bpmn:userTask id="Task_Compliance" name="Compliance review" mini:formFields="cleared:boolean,note:string" />
+    <bpmn:boundaryEvent id="Timer_Remind" name="20s: remind" attachedToRef="Task_Compliance" cancelActivity="false">
+      <bpmn:timerEventDefinition id="TimerDef_Remind"><bpmn:timeDuration xsi:type="bpmn:tFormalExpression">PT20S</bpmn:timeDuration></bpmn:timerEventDefinition>
+    </bpmn:boundaryEvent>
+    <bpmn:boundaryEvent id="Timer_Escalate" name="45s: escalate" attachedToRef="Task_Compliance">
+      <bpmn:timerEventDefinition id="TimerDef_Escalate"><bpmn:timeDuration xsi:type="bpmn:tFormalExpression">PT45S</bpmn:timeDuration></bpmn:timerEventDefinition>
+    </bpmn:boundaryEvent>
+    <bpmn:serviceTask id="Task_Remind" name="Remind the reviewer" mini:handler="compliance.remind" />
+    <bpmn:endEvent id="End_Reminded" name="Reminder sent" />
+    <bpmn:userTask id="Task_HeadCompliance" name="Head of compliance decides" mini:formFields="cleared:boolean,note:string" />
+    <bpmn:exclusiveGateway id="Gw_Cleared" name="Cleared?" default="Flow_NotCleared" />
+    <bpmn:endEvent id="End_RefusedCompliance" name="Refused by compliance">
+      <bpmn:terminateEventDefinition id="TermDef_Refused" />
+    </bpmn:endEvent>
+    <bpmn:serviceTask id="Task_NotifyRefused" name="Tell customer we can't ship" mini:handler="customer.notify" />
+    <bpmn:endEvent id="End_Blocked" name="Refused: embargo" />
+    <bpmn:exclusiveGateway id="Gw_RiskMerge" />
+
+    <!-- ② bookings: one sub-process, one error boundary, compensation for whatever was booked -->
+    <bpmn:subProcess id="Sub_Booking" name="Book the transport chain">
+      <bpmn:startEvent id="Sub_Start" />
+      <bpmn:parallelGateway id="Gw_Fork" />
+      <bpmn:serviceTask id="Task_Ocean" name="Book vessel slots" mini:handler="ocean.book" />
+      <bpmn:boundaryEvent id="Comp_Ocean" attachedToRef="Task_Ocean"><bpmn:compensateEventDefinition id="CompDef_Ocean" /></bpmn:boundaryEvent>
+      <bpmn:serviceTask id="Undo_Ocean" name="Cancel ocean booking" isForCompensation="true" mini:handler="ocean.cancel" />
+      <bpmn:serviceTask id="Task_Warehouse" name="Reserve warehouse space" mini:handler="warehouse.reserve" />
+      <bpmn:boundaryEvent id="Comp_Warehouse" attachedToRef="Task_Warehouse"><bpmn:compensateEventDefinition id="CompDef_Warehouse" /></bpmn:boundaryEvent>
+      <bpmn:serviceTask id="Undo_Warehouse" name="Release warehouse space" isForCompensation="true" mini:handler="warehouse.release" />
+      <bpmn:parallelGateway id="Gw_Join" />
+      <bpmn:serviceTask id="Task_Trucks" name="Book trucks" mini:handler="trucking.book" />
+      <bpmn:boundaryEvent id="Comp_Trucks" attachedToRef="Task_Trucks"><bpmn:compensateEventDefinition id="CompDef_Trucks" /></bpmn:boundaryEvent>
+      <bpmn:serviceTask id="Undo_Trucks" name="Cancel truck order" isForCompensation="true" mini:handler="trucking.cancel" />
+      <bpmn:endEvent id="Sub_End" name="All booked" />
+      <bpmn:association id="Assoc_Ocean" associationDirection="One" sourceRef="Comp_Ocean" targetRef="Undo_Ocean" />
+      <bpmn:association id="Assoc_Warehouse" associationDirection="One" sourceRef="Comp_Warehouse" targetRef="Undo_Warehouse" />
+      <bpmn:association id="Assoc_Trucks" associationDirection="One" sourceRef="Comp_Trucks" targetRef="Undo_Trucks" />
+      <bpmn:sequenceFlow id="Flow_S1" sourceRef="Sub_Start" targetRef="Gw_Fork" />
+      <bpmn:sequenceFlow id="Flow_S2" sourceRef="Gw_Fork" targetRef="Task_Ocean" />
+      <bpmn:sequenceFlow id="Flow_S3" sourceRef="Gw_Fork" targetRef="Task_Warehouse" />
+      <bpmn:sequenceFlow id="Flow_S4" sourceRef="Task_Ocean" targetRef="Gw_Join" />
+      <bpmn:sequenceFlow id="Flow_S5" sourceRef="Task_Warehouse" targetRef="Gw_Join" />
+      <bpmn:sequenceFlow id="Flow_S6" sourceRef="Gw_Join" targetRef="Task_Trucks" />
+      <bpmn:sequenceFlow id="Flow_S7" sourceRef="Task_Trucks" targetRef="Sub_End" />
+    </bpmn:subProcess>
+    <bpmn:boundaryEvent id="Err_Booking" name="Booking rejected" attachedToRef="Sub_Booking">
+      <bpmn:errorEventDefinition id="ErrDef_Booking" errorRef="Error_Rejected" />
+    </bpmn:boundaryEvent>
+    <bpmn:intermediateThrowEvent id="Throw_UndoBooking" name="Undo what was booked">
+      <bpmn:compensateEventDefinition id="CompDef_ThrowBooking" />
+    </bpmn:intermediateThrowEvent>
+    <bpmn:endEvent id="End_BookingFailed" name="Booking failed" />
+
+    <!-- ③ customs: a separate, separately versioned process -->
+    <bpmn:callActivity id="Call_Customs" name="Customs clearance" calledElement="customs-clearance"
+                       mini:calledElementBinding="versionTag" mini:calledElementVersionTag="${customsRelease}"
+                       mini:inputs="shipment,shipmentRef,risk" mini:outputs="customs" />
+    <bpmn:boundaryEvent id="Timer_CustomsSlow" name="40s: customs is slow" attachedToRef="Call_Customs" cancelActivity="false">
+      <bpmn:timerEventDefinition id="TimerDef_CustomsSlow"><bpmn:timeDuration xsi:type="bpmn:tFormalExpression">PT40S</bpmn:timeDuration></bpmn:timerEventDefinition>
+    </bpmn:boundaryEvent>
+    <bpmn:serviceTask id="Task_NotifyCustomsSlow" name="Tell customer customs is slow" mini:handler="customer.notify" />
+    <bpmn:endEvent id="End_CustomsSlowNotified" name="Customer informed" />
+    <bpmn:boundaryEvent id="Err_Seized" name="Cargo seized" attachedToRef="Call_Customs">
+      <bpmn:errorEventDefinition id="ErrDef_Seized" errorRef="Error_Seized" />
+    </bpmn:boundaryEvent>
+    <bpmn:intermediateThrowEvent id="Throw_UndoSeized" name="Cancel all bookings">
+      <bpmn:compensateEventDefinition id="CompDef_ThrowSeized" />
+    </bpmn:intermediateThrowEvent>
+    <bpmn:serviceTask id="Task_NotifySeized" name="Tell customer: cargo seized" mini:handler="customer.notify" />
+    <bpmn:endEvent id="End_Seized" name="Cargo seized" />
+
+    <!-- ④ arrival: wait for an external message -->
+    <bpmn:receiveTask id="Wait_Arrival" name="Wait for vessel arrival" messageRef="Msg_VesselArrived" />
+    <bpmn:boundaryEvent id="Msg_Address" name="Address changed" attachedToRef="Wait_Arrival" cancelActivity="false">
+      <bpmn:messageEventDefinition id="MsgDef_Address" messageRef="Msg_AddressChanged" />
+    </bpmn:boundaryEvent>
+    <bpmn:serviceTask id="Task_UpdateAddress" name="Update delivery address" mini:handler="delivery.updateAddress" />
+    <bpmn:endEvent id="End_AddressUpdated" name="Address updated" />
+    <bpmn:boundaryEvent id="Timer_VesselLate" name="60s: vessel late" attachedToRef="Wait_Arrival">
+      <bpmn:timerEventDefinition id="TimerDef_VesselLate"><bpmn:timeDuration xsi:type="bpmn:tFormalExpression">PT60S</bpmn:timeDuration></bpmn:timerEventDefinition>
+    </bpmn:boundaryEvent>
+    <bpmn:serviceTask id="Task_NotifyDelay" name="Tell customer about the delay" mini:handler="customer.notify" />
+
+    <!-- ⑤ last mile: once per container -->
+    <bpmn:serviceTask id="Task_PlanDelivery" name="Plan a delivery slot per container" mini:handler="delivery.plan">
+      <bpmn:multiInstanceLoopCharacteristics isSequential="true" mini:collection="${containerList}" mini:elementVariable="container"
+                                             mini:outputCollection="deliveryPlan" mini:outputElement="${slot}" />
+    </bpmn:serviceTask>
+    <bpmn:userTask id="Task_Deliver" name="Confirm delivery of each container" mini:formFields="receivedBy:string,damaged:boolean">
+      <bpmn:multiInstanceLoopCharacteristics mini:collection="${containerList}" mini:elementVariable="container"
+                                             mini:outputCollection="proofsOfDelivery" mini:outputElement="${({ container: container.number, receivedBy, damaged })}" />
+    </bpmn:userTask>
+    <bpmn:exclusiveGateway id="Gw_Damage" name="Any damage?" default="Flow_NoDamage" />
+    <bpmn:serviceTask id="Task_Claim" name="Open insurance claim" mini:handler="claims.open" />
+    <bpmn:exclusiveGateway id="Gw_DamageMerge" />
+
+    <!-- ⑥ billing -->
+    <bpmn:serviceTask id="Task_Invoice" name="Invoice the customer" mini:handler="billing.charge" />
+    <bpmn:boundaryEvent id="Err_Payment" name="Charge refused" attachedToRef="Task_Invoice">
+      <bpmn:errorEventDefinition id="ErrDef_Payment" errorRef="Error_Rejected" />
+    </bpmn:boundaryEvent>
+    <bpmn:userTask id="Task_CollectManually" name="Collect payment manually" mini:formFields="collected:boolean,note:string" />
+    <bpmn:endEvent id="End_ManualPayment" name="Delivered, payment chased" />
+    <bpmn:endEvent id="End_Done" name="Delivered &amp; invoiced" />
+
+    <bpmn:sequenceFlow id="Flow_1" sourceRef="Start_Order" targetRef="Task_Register" />
+    <bpmn:sequenceFlow id="Flow_2" sourceRef="Task_Register" targetRef="Task_Risk" />
+    <bpmn:sequenceFlow id="Flow_3" sourceRef="Task_Risk" targetRef="Gw_Risk" />
+    <bpmn:sequenceFlow id="Flow_High" name="high" sourceRef="Gw_Risk" targetRef="Task_Compliance">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">${risk.level === 'high'}</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="Flow_Blocked" name="blocked" sourceRef="Gw_Risk" targetRef="Task_NotifyRefused">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">${risk.level === 'blocked'}</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="Flow_Low" name="low" sourceRef="Gw_Risk" targetRef="Gw_RiskMerge" />
+    <bpmn:sequenceFlow id="Flow_RefusedEnd" sourceRef="Task_NotifyRefused" targetRef="End_Blocked" />
+    <bpmn:sequenceFlow id="Flow_Remind" sourceRef="Timer_Remind" targetRef="Task_Remind" />
+    <bpmn:sequenceFlow id="Flow_Reminded" sourceRef="Task_Remind" targetRef="End_Reminded" />
+    <bpmn:sequenceFlow id="Flow_Escalate" sourceRef="Timer_Escalate" targetRef="Task_HeadCompliance" />
+    <bpmn:sequenceFlow id="Flow_Reviewed" sourceRef="Task_Compliance" targetRef="Gw_Cleared" />
+    <bpmn:sequenceFlow id="Flow_HeadDecided" sourceRef="Task_HeadCompliance" targetRef="Gw_Cleared" />
+    <bpmn:sequenceFlow id="Flow_Cleared" name="yes" sourceRef="Gw_Cleared" targetRef="Gw_RiskMerge">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">${cleared === true}</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="Flow_NotCleared" name="no" sourceRef="Gw_Cleared" targetRef="End_RefusedCompliance" />
+    <bpmn:sequenceFlow id="Flow_4" sourceRef="Gw_RiskMerge" targetRef="Sub_Booking" />
+    <bpmn:sequenceFlow id="Flow_BookingError" sourceRef="Err_Booking" targetRef="Throw_UndoBooking" />
+    <bpmn:sequenceFlow id="Flow_BookingFailed" sourceRef="Throw_UndoBooking" targetRef="End_BookingFailed" />
+    <bpmn:sequenceFlow id="Flow_5" sourceRef="Sub_Booking" targetRef="Call_Customs" />
+    <bpmn:sequenceFlow id="Flow_CustomsSlow" sourceRef="Timer_CustomsSlow" targetRef="Task_NotifyCustomsSlow" />
+    <bpmn:sequenceFlow id="Flow_CustomsSlowDone" sourceRef="Task_NotifyCustomsSlow" targetRef="End_CustomsSlowNotified" />
+    <bpmn:sequenceFlow id="Flow_SeizedError" sourceRef="Err_Seized" targetRef="Throw_UndoSeized" />
+    <bpmn:sequenceFlow id="Flow_SeizedNotify" sourceRef="Throw_UndoSeized" targetRef="Task_NotifySeized" />
+    <bpmn:sequenceFlow id="Flow_SeizedEnd" sourceRef="Task_NotifySeized" targetRef="End_Seized" />
+    <bpmn:sequenceFlow id="Flow_6" sourceRef="Call_Customs" targetRef="Wait_Arrival" />
+    <bpmn:sequenceFlow id="Flow_Address" sourceRef="Msg_Address" targetRef="Task_UpdateAddress" />
+    <bpmn:sequenceFlow id="Flow_AddressDone" sourceRef="Task_UpdateAddress" targetRef="End_AddressUpdated" />
+    <bpmn:sequenceFlow id="Flow_Late" sourceRef="Timer_VesselLate" targetRef="Task_NotifyDelay" />
+    <bpmn:sequenceFlow id="Flow_WaitAgain" name="keep waiting" sourceRef="Task_NotifyDelay" targetRef="Wait_Arrival" />
+    <bpmn:sequenceFlow id="Flow_7" sourceRef="Wait_Arrival" targetRef="Task_PlanDelivery" />
+    <bpmn:sequenceFlow id="Flow_8" sourceRef="Task_PlanDelivery" targetRef="Task_Deliver" />
+    <bpmn:sequenceFlow id="Flow_9" sourceRef="Task_Deliver" targetRef="Gw_Damage" />
+    <bpmn:sequenceFlow id="Flow_Damage" name="yes" sourceRef="Gw_Damage" targetRef="Task_Claim">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">${proofsOfDelivery.some((p) =&gt; p.damaged)}</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="Flow_NoDamage" name="no" sourceRef="Gw_Damage" targetRef="Gw_DamageMerge" />
+    <bpmn:sequenceFlow id="Flow_Claimed" sourceRef="Task_Claim" targetRef="Gw_DamageMerge" />
+    <bpmn:sequenceFlow id="Flow_10" sourceRef="Gw_DamageMerge" targetRef="Task_Invoice" />
+    <bpmn:sequenceFlow id="Flow_11" sourceRef="Task_Invoice" targetRef="End_Done" />
+    <bpmn:sequenceFlow id="Flow_PaymentError" sourceRef="Err_Payment" targetRef="Task_CollectManually" />
+    <bpmn:sequenceFlow id="Flow_Collected" sourceRef="Task_CollectManually" targetRef="End_ManualPayment" />
+  </bpmn:process>
+
+  <bpmndi:BPMNDiagram id="Diagram_import-shipment">
+    <bpmndi:BPMNPlane id="Plane_import-shipment" bpmnElement="import-shipment">
+      <!-- ① intake and compliance -->
+      <bpmndi:BPMNShape id="Start_Order_di" bpmnElement="Start_Order"><dc:Bounds x="152" y="482" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_Register_di" bpmnElement="Task_Register"><dc:Bounds x="230" y="460" width="100" height="80" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_Risk_di" bpmnElement="Task_Risk"><dc:Bounds x="380" y="460" width="100" height="80" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Gw_Risk_di" bpmnElement="Gw_Risk" isMarkerVisible="true"><dc:Bounds x="525" y="475" width="50" height="50" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_Compliance_di" bpmnElement="Task_Compliance"><dc:Bounds x="620" y="280" width="100" height="80" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Timer_Remind_di" bpmnElement="Timer_Remind"><dc:Bounds x="622" y="262" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Timer_Escalate_di" bpmnElement="Timer_Escalate"><dc:Bounds x="682" y="262" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_Remind_di" bpmnElement="Task_Remind"><dc:Bounds x="590" y="130" width="100" height="80" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="End_Reminded_di" bpmnElement="End_Reminded"><dc:Bounds x="722" y="152" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_HeadCompliance_di" bpmnElement="Task_HeadCompliance"><dc:Bounds x="790" y="280" width="100" height="80" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Gw_Cleared_di" bpmnElement="Gw_Cleared" isMarkerVisible="true"><dc:Bounds x="925" y="295" width="50" height="50" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="End_RefusedCompliance_di" bpmnElement="End_RefusedCompliance"><dc:Bounds x="932" y="182" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_NotifyRefused_di" bpmnElement="Task_NotifyRefused"><dc:Bounds x="620" y="620" width="100" height="80" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="End_Blocked_di" bpmnElement="End_Blocked"><dc:Bounds x="772" y="642" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Gw_RiskMerge_di" bpmnElement="Gw_RiskMerge" isMarkerVisible="true"><dc:Bounds x="1015" y="475" width="50" height="50" /></bpmndi:BPMNShape>
+
+      <!-- ② the booking sub-process -->
+      <bpmndi:BPMNShape id="Sub_Booking_di" bpmnElement="Sub_Booking" isExpanded="true"><dc:Bounds x="1100" y="220" width="620" height="580" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Sub_Start_di" bpmnElement="Sub_Start"><dc:Bounds x="1132" y="482" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Gw_Fork_di" bpmnElement="Gw_Fork"><dc:Bounds x="1205" y="475" width="50" height="50" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Undo_Ocean_di" bpmnElement="Undo_Ocean"><dc:Bounds x="1290" y="240" width="100" height="80" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_Ocean_di" bpmnElement="Task_Ocean"><dc:Bounds x="1290" y="360" width="100" height="80" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Comp_Ocean_di" bpmnElement="Comp_Ocean"><dc:Bounds x="1322" y="342" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_Warehouse_di" bpmnElement="Task_Warehouse"><dc:Bounds x="1290" y="560" width="100" height="80" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Comp_Warehouse_di" bpmnElement="Comp_Warehouse"><dc:Bounds x="1322" y="622" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Undo_Warehouse_di" bpmnElement="Undo_Warehouse"><dc:Bounds x="1290" y="700" width="100" height="80" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Gw_Join_di" bpmnElement="Gw_Join"><dc:Bounds x="1435" y="475" width="50" height="50" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_Trucks_di" bpmnElement="Task_Trucks"><dc:Bounds x="1510" y="460" width="100" height="80" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Comp_Trucks_di" bpmnElement="Comp_Trucks"><dc:Bounds x="1542" y="522" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Undo_Trucks_di" bpmnElement="Undo_Trucks"><dc:Bounds x="1510" y="620" width="100" height="80" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Sub_End_di" bpmnElement="Sub_End"><dc:Bounds x="1662" y="482" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Err_Booking_di" bpmnElement="Err_Booking"><dc:Bounds x="1382" y="782" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Throw_UndoBooking_di" bpmnElement="Throw_UndoBooking"><dc:Bounds x="1382" y="862" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="End_BookingFailed_di" bpmnElement="End_BookingFailed"><dc:Bounds x="1482" y="862" width="36" height="36" /></bpmndi:BPMNShape>
+
+      <!-- ③ customs -->
+      <bpmndi:BPMNShape id="Call_Customs_di" bpmnElement="Call_Customs"><dc:Bounds x="1780" y="460" width="100" height="80" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Timer_CustomsSlow_di" bpmnElement="Timer_CustomsSlow"><dc:Bounds x="1812" y="442" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_NotifyCustomsSlow_di" bpmnElement="Task_NotifyCustomsSlow"><dc:Bounds x="1780" y="320" width="100" height="80" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="End_CustomsSlowNotified_di" bpmnElement="End_CustomsSlowNotified"><dc:Bounds x="1812" y="232" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Err_Seized_di" bpmnElement="Err_Seized"><dc:Bounds x="1812" y="522" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Throw_UndoSeized_di" bpmnElement="Throw_UndoSeized"><dc:Bounds x="1812" y="582" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_NotifySeized_di" bpmnElement="Task_NotifySeized"><dc:Bounds x="1780" y="650" width="100" height="80" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="End_Seized_di" bpmnElement="End_Seized"><dc:Bounds x="1812" y="772" width="36" height="36" /></bpmndi:BPMNShape>
+
+      <!-- ④ arrival -->
+      <bpmndi:BPMNShape id="Wait_Arrival_di" bpmnElement="Wait_Arrival"><dc:Bounds x="1960" y="460" width="100" height="80" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Msg_Address_di" bpmnElement="Msg_Address"><dc:Bounds x="1972" y="442" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_UpdateAddress_di" bpmnElement="Task_UpdateAddress"><dc:Bounds x="1940" y="320" width="100" height="80" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="End_AddressUpdated_di" bpmnElement="End_AddressUpdated"><dc:Bounds x="1972" y="232" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Timer_VesselLate_di" bpmnElement="Timer_VesselLate"><dc:Bounds x="1972" y="522" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_NotifyDelay_di" bpmnElement="Task_NotifyDelay"><dc:Bounds x="1940" y="600" width="100" height="80" /></bpmndi:BPMNShape>
+
+      <!-- ⑤ last mile and ⑥ billing -->
+      <bpmndi:BPMNShape id="Task_PlanDelivery_di" bpmnElement="Task_PlanDelivery"><dc:Bounds x="2120" y="460" width="100" height="80" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_Deliver_di" bpmnElement="Task_Deliver"><dc:Bounds x="2270" y="460" width="100" height="80" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Gw_Damage_di" bpmnElement="Gw_Damage" isMarkerVisible="true"><dc:Bounds x="2415" y="475" width="50" height="50" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_Claim_di" bpmnElement="Task_Claim"><dc:Bounds x="2490" y="340" width="100" height="80" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Gw_DamageMerge_di" bpmnElement="Gw_DamageMerge" isMarkerVisible="true"><dc:Bounds x="2615" y="475" width="50" height="50" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_Invoice_di" bpmnElement="Task_Invoice"><dc:Bounds x="2700" y="460" width="100" height="80" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Err_Payment_di" bpmnElement="Err_Payment"><dc:Bounds x="2732" y="522" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_CollectManually_di" bpmnElement="Task_CollectManually"><dc:Bounds x="2700" y="600" width="100" height="80" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="End_ManualPayment_di" bpmnElement="End_ManualPayment"><dc:Bounds x="2852" y="622" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="End_Done_di" bpmnElement="End_Done"><dc:Bounds x="2852" y="482" width="36" height="36" /></bpmndi:BPMNShape>
+
+      <!-- edges -->
+      <bpmndi:BPMNEdge id="Flow_1_di" bpmnElement="Flow_1"><di:waypoint x="188" y="500" /><di:waypoint x="230" y="500" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_2_di" bpmnElement="Flow_2"><di:waypoint x="330" y="500" /><di:waypoint x="380" y="500" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_3_di" bpmnElement="Flow_3"><di:waypoint x="480" y="500" /><di:waypoint x="525" y="500" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_High_di" bpmnElement="Flow_High"><di:waypoint x="550" y="475" /><di:waypoint x="550" y="320" /><di:waypoint x="620" y="320" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Blocked_di" bpmnElement="Flow_Blocked"><di:waypoint x="550" y="525" /><di:waypoint x="550" y="660" /><di:waypoint x="620" y="660" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Low_di" bpmnElement="Flow_Low"><di:waypoint x="575" y="500" /><di:waypoint x="1015" y="500" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_RefusedEnd_di" bpmnElement="Flow_RefusedEnd"><di:waypoint x="720" y="660" /><di:waypoint x="772" y="660" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Remind_di" bpmnElement="Flow_Remind"><di:waypoint x="640" y="262" /><di:waypoint x="640" y="210" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Reminded_di" bpmnElement="Flow_Reminded"><di:waypoint x="690" y="170" /><di:waypoint x="722" y="170" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Escalate_di" bpmnElement="Flow_Escalate"><di:waypoint x="700" y="262" /><di:waypoint x="700" y="235" /><di:waypoint x="840" y="235" /><di:waypoint x="840" y="280" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Reviewed_di" bpmnElement="Flow_Reviewed"><di:waypoint x="670" y="360" /><di:waypoint x="670" y="400" /><di:waypoint x="950" y="400" /><di:waypoint x="950" y="345" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_HeadDecided_di" bpmnElement="Flow_HeadDecided"><di:waypoint x="890" y="320" /><di:waypoint x="925" y="320" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Cleared_di" bpmnElement="Flow_Cleared"><di:waypoint x="975" y="320" /><di:waypoint x="1040" y="320" /><di:waypoint x="1040" y="475" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_NotCleared_di" bpmnElement="Flow_NotCleared"><di:waypoint x="950" y="295" /><di:waypoint x="950" y="218" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_4_di" bpmnElement="Flow_4"><di:waypoint x="1065" y="500" /><di:waypoint x="1100" y="500" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_S1_di" bpmnElement="Flow_S1"><di:waypoint x="1168" y="500" /><di:waypoint x="1205" y="500" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_S2_di" bpmnElement="Flow_S2"><di:waypoint x="1230" y="475" /><di:waypoint x="1230" y="400" /><di:waypoint x="1290" y="400" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_S3_di" bpmnElement="Flow_S3"><di:waypoint x="1230" y="525" /><di:waypoint x="1230" y="600" /><di:waypoint x="1290" y="600" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_S4_di" bpmnElement="Flow_S4"><di:waypoint x="1390" y="400" /><di:waypoint x="1460" y="400" /><di:waypoint x="1460" y="475" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_S5_di" bpmnElement="Flow_S5"><di:waypoint x="1390" y="600" /><di:waypoint x="1460" y="600" /><di:waypoint x="1460" y="525" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_S6_di" bpmnElement="Flow_S6"><di:waypoint x="1485" y="500" /><di:waypoint x="1510" y="500" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_S7_di" bpmnElement="Flow_S7"><di:waypoint x="1610" y="500" /><di:waypoint x="1662" y="500" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Assoc_Ocean_di" bpmnElement="Assoc_Ocean"><di:waypoint x="1340" y="342" /><di:waypoint x="1340" y="320" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Assoc_Warehouse_di" bpmnElement="Assoc_Warehouse"><di:waypoint x="1340" y="658" /><di:waypoint x="1340" y="700" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Assoc_Trucks_di" bpmnElement="Assoc_Trucks"><di:waypoint x="1560" y="558" /><di:waypoint x="1560" y="620" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_BookingError_di" bpmnElement="Flow_BookingError"><di:waypoint x="1400" y="818" /><di:waypoint x="1400" y="862" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_BookingFailed_di" bpmnElement="Flow_BookingFailed"><di:waypoint x="1418" y="880" /><di:waypoint x="1482" y="880" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_5_di" bpmnElement="Flow_5"><di:waypoint x="1720" y="500" /><di:waypoint x="1780" y="500" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_CustomsSlow_di" bpmnElement="Flow_CustomsSlow"><di:waypoint x="1830" y="442" /><di:waypoint x="1830" y="400" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_CustomsSlowDone_di" bpmnElement="Flow_CustomsSlowDone"><di:waypoint x="1830" y="320" /><di:waypoint x="1830" y="268" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_SeizedError_di" bpmnElement="Flow_SeizedError"><di:waypoint x="1830" y="558" /><di:waypoint x="1830" y="582" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_SeizedNotify_di" bpmnElement="Flow_SeizedNotify"><di:waypoint x="1830" y="618" /><di:waypoint x="1830" y="650" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_SeizedEnd_di" bpmnElement="Flow_SeizedEnd"><di:waypoint x="1830" y="730" /><di:waypoint x="1830" y="772" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_6_di" bpmnElement="Flow_6"><di:waypoint x="1880" y="500" /><di:waypoint x="1960" y="500" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Address_di" bpmnElement="Flow_Address"><di:waypoint x="1990" y="442" /><di:waypoint x="1990" y="400" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_AddressDone_di" bpmnElement="Flow_AddressDone"><di:waypoint x="1990" y="320" /><di:waypoint x="1990" y="268" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Late_di" bpmnElement="Flow_Late"><di:waypoint x="1990" y="558" /><di:waypoint x="1990" y="600" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_WaitAgain_di" bpmnElement="Flow_WaitAgain"><di:waypoint x="2040" y="640" /><di:waypoint x="2070" y="640" /><di:waypoint x="2070" y="570" /><di:waypoint x="2045" y="570" /><di:waypoint x="2045" y="540" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_7_di" bpmnElement="Flow_7"><di:waypoint x="2060" y="500" /><di:waypoint x="2120" y="500" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_8_di" bpmnElement="Flow_8"><di:waypoint x="2220" y="500" /><di:waypoint x="2270" y="500" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_9_di" bpmnElement="Flow_9"><di:waypoint x="2370" y="500" /><di:waypoint x="2415" y="500" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Damage_di" bpmnElement="Flow_Damage"><di:waypoint x="2440" y="475" /><di:waypoint x="2440" y="380" /><di:waypoint x="2490" y="380" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_NoDamage_di" bpmnElement="Flow_NoDamage"><di:waypoint x="2465" y="500" /><di:waypoint x="2615" y="500" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Claimed_di" bpmnElement="Flow_Claimed"><di:waypoint x="2590" y="380" /><di:waypoint x="2640" y="380" /><di:waypoint x="2640" y="475" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_10_di" bpmnElement="Flow_10"><di:waypoint x="2665" y="500" /><di:waypoint x="2700" y="500" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_11_di" bpmnElement="Flow_11"><di:waypoint x="2800" y="500" /><di:waypoint x="2852" y="500" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_PaymentError_di" bpmnElement="Flow_PaymentError"><di:waypoint x="2750" y="558" /><di:waypoint x="2750" y="600" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Collected_di" bpmnElement="Flow_Collected"><di:waypoint x="2800" y="640" /><di:waypoint x="2852" y="640" /></bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>

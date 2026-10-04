@@ -1,0 +1,839 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mini BPMN</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 16 16%22><rect x=%223%22 y=%223%22 width=%2210%22 height=%2210%22 rx=%222%22 fill=%22%232f6fdb%22/></svg>">
+<!-- bpmn-js is the open-source modeling library behind the Camunda Modeler. It only DRAWS and EDITS
+     BPMN; executing it is the engine's job (apps/bpmn-engine/src/engine). -->
+<link rel="stylesheet" href="https://unpkg.com/bpmn-js@18.31.0/dist/assets/diagram-js.css">
+<link rel="stylesheet" href="https://unpkg.com/bpmn-js@18.31.0/dist/assets/bpmn-js.css">
+<link rel="stylesheet" href="https://unpkg.com/bpmn-js@18.31.0/dist/assets/bpmn-font/css/bpmn-embedded.css">
+<style>
+  :root {
+    --bg: #f5f6f8; --panel: #ffffff; --panel-2: #f0f2f5; --border: #dde1e7;
+    --text: #1b1f24; --muted: #667080; --faint: #9aa3b0;
+    --accent: #2f6fdb; --ok: #1f9d55; --bad: #d64545; --warn: #c77d10;
+    --accent-bg: #e8f0fd; --ok-bg: #e5f6ec; --bad-bg: #fbe9e9; --warn-bg: #fdf3e2;
+    --shadow: 0 1px 2px rgba(16,24,40,.06), 0 1px 3px rgba(16,24,40,.08);
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0f1216; --panel: #171b21; --panel-2: #1e232b; --border: #2a313b;
+      --text: #e6e9ee; --muted: #9aa4b2; --faint: #6b7584;
+      --accent: #6ea1ff; --ok: #4cc485; --bad: #f07272; --warn: #f0ac3c;
+      --accent-bg: #1a2740; --ok-bg: #122e20; --bad-bg: #3a1a1a; --warn-bg: #33260f;
+      --shadow: none;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  button { font: inherit; cursor: pointer; }
+  input, select, textarea { font: inherit; color: var(--text); background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px; padding: 4px 6px; }
+  textarea { font-family: var(--mono); font-size: 12px; resize: vertical; }
+  code, .mono { font-family: var(--mono); font-size: 12px; }
+
+  header { display: flex; align-items: baseline; gap: 14px; padding: 12px 20px; border-bottom: 1px solid var(--border); background: var(--panel); flex-wrap: wrap; }
+  header h1 { font-size: 16px; margin: 0; font-weight: 650; }
+  header .sub { color: var(--muted); font-size: 13px; }
+
+  .layout { display: grid; grid-template-columns: 310px minmax(0, 1fr); gap: 16px; padding: 16px 20px; max-width: 1600px; margin: 0 auto; }
+  @media (max-width: 900px) { .layout { grid-template-columns: minmax(0, 1fr); padding: 12px 16px; } }
+  aside, main { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; box-shadow: var(--shadow); min-width: 0; }
+  .panel > h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0; padding: 12px 14px 8px; font-weight: 650; display: flex; align-items: center; gap: 8px; }
+  .panel > h2 .spacer { flex: 1; }
+  .pad { padding: 0 14px 14px; }
+
+  .btn { background: var(--accent); color: #fff; border: 0; border-radius: 6px; padding: 5px 12px; font-weight: 600; font-size: 13px; }
+  .btn.ghost { background: var(--panel-2); color: var(--text); border: 1px solid var(--border); }
+  .btn.warn { background: var(--warn); }
+  .btn.bad { background: var(--bad); }
+  .btn.small { padding: 2px 8px; font-size: 12px; }
+  .btn:disabled { opacity: .5; cursor: default; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .muted { color: var(--muted); }
+  .err { color: var(--bad); font-size: 12px; white-space: pre-wrap; }
+
+  .list { display: flex; flex-direction: column; padding: 0 8px 8px; }
+  .item { display: block; width: 100%; text-align: left; background: none; border: 1px solid transparent; border-radius: 8px; padding: 6px 8px; color: var(--text); }
+  .item:hover { background: var(--panel-2); border-color: var(--border); }
+  .item.sel { background: var(--accent-bg); border-color: var(--accent); }
+  .item b { font-weight: 600; font-size: 13px; }
+  .item .meta { color: var(--muted); font-size: 12px; }
+  .instances { max-height: 360px; overflow: auto; }
+
+  .pill { display: inline-flex; align-items: center; padding: 1px 8px; border-radius: 999px; font-size: 11px; font-weight: 650; border: 1px solid var(--border); background: var(--panel-2); color: var(--muted); white-space: nowrap; }
+  .pill.RUNNING { color: var(--accent); background: var(--accent-bg); border-color: transparent; }
+  .pill.COMPLETED { color: var(--ok); background: var(--ok-bg); border-color: transparent; }
+  .pill.CANCELLED { color: var(--muted); }
+  .pill.TERMINATED { color: var(--warn); background: var(--warn-bg); border-color: transparent; }
+  .pill.tag { font-family: var(--mono); font-weight: 500; }
+  .versions-list { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+  .links { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; padding: 0 14px 8px; font-size: 12px; color: var(--muted); }
+  .links:empty { display: none; }
+  .linkbtn { background: none; border: 0; padding: 0; color: var(--accent); font: 12px var(--mono); text-decoration: underline; }
+  .card.msg { border-color: var(--accent); }
+  .card .sub { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+  .card textarea { width: 100%; min-height: 44px; }
+  .mig-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; }
+  @media (max-width: 900px) { .mig-grid { grid-template-columns: minmax(0, 1fr); } }
+  .diff { font-size: 12px; font-family: var(--mono); max-height: 200px; overflow: auto; }
+  .diff .add { color: var(--ok); } .diff .del { color: var(--bad); } .diff .chg { color: var(--warn); }
+  #migMapping { width: 100%; min-height: 54px; }
+  .ok-text { color: var(--ok); font-size: 12px; white-space: pre-wrap; }
+  .pill.incident { color: var(--bad); background: var(--bad-bg); border-color: transparent; }
+
+  .presets { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+  .presets button { background: var(--panel-2); border: 1px solid var(--border); color: var(--text); border-radius: 999px; padding: 2px 10px; font-size: 12px; }
+  .presets button:hover { border-color: var(--accent); }
+  #startVars { width: 100%; min-height: 90px; }
+
+  .tabs { display: flex; gap: 4px; padding: 8px 8px 0; border-bottom: 1px solid var(--border); }
+  .tab { background: none; border: 0; border-bottom: 2px solid transparent; padding: 6px 12px; color: var(--muted); font-weight: 600; }
+  .tab.on { color: var(--text); border-bottom-color: var(--accent); }
+  .toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; padding: 10px 14px; border-bottom: 1px solid var(--border); }
+  .toolbar .spacer { flex: 1; }
+
+  /* The canvases stay on light "paper" in both themes, like a printed diagram. */
+  .canvas { height: 520px; background: #fff; color: #1b1f24; position: relative; }
+  .modeler-wrap { display: grid; grid-template-columns: minmax(0, 1fr) 280px; }
+  @media (max-width: 1100px) { .modeler-wrap { grid-template-columns: minmax(0, 1fr); } }
+  .props { border-left: 1px solid var(--border); padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; font-size: 13px; }
+  .props label { display: flex; flex-direction: column; gap: 3px; color: var(--muted); font-size: 12px; }
+  .props label.check { flex-direction: row; align-items: center; gap: 6px; }
+  .props input[type=text], .props select { width: 100%; font-family: var(--mono); font-size: 12px; }
+  .props .hint { color: var(--faint); font-size: 12px; }
+  .props .type { font-family: var(--mono); font-size: 12px; color: var(--accent); }
+  #xmlBox { display: none; width: 100%; height: 520px; border: 0; border-radius: 0; background: var(--panel); }
+  #deployResult { padding: 8px 14px; display: none; }
+
+  .cockpit-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+  @media (max-width: 1100px) { .cockpit-grid { grid-template-columns: minmax(0, 1fr); } }
+  .card { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; background: var(--panel-2); }
+  .card h3 { margin: 0 0 6px; font-size: 13px; }
+  .card form { display: flex; flex-direction: column; gap: 6px; }
+  .card form label { display: flex; gap: 8px; align-items: center; font-size: 12px; color: var(--muted); }
+  .card.incident { border-color: var(--bad); background: var(--bad-bg); }
+  pre.vars { margin: 0; font-family: var(--mono); font-size: 12px; max-height: 320px; overflow: auto; white-space: pre-wrap; word-break: break-word; }
+  .history { max-height: 360px; overflow: auto; font-size: 12px; }
+  .h { display: grid; grid-template-columns: 64px 130px minmax(0, 1fr); gap: 8px; padding: 3px 0; border-bottom: 1px dashed var(--border); }
+  .h .t { color: var(--faint); font-family: var(--mono); }
+  .h .k { font-family: var(--mono); color: var(--muted); }
+  .h.incident .k, .h.error-caught .k { color: var(--bad); }
+  .h.compensated .k, .h.compensation-started .k { color: var(--warn); }
+  .h.instance-completed .k { color: var(--ok); }
+  .h.message-received .k, .h.timer-fired .k, .h.called .k, .h.loop-started .k, .h.migrated .k { color: var(--accent); }
+  .h.error-propagated .k { color: var(--bad); }
+  .h.variables-changed .k { color: var(--accent); }
+  .empty { color: var(--faint); font-size: 13px; padding: 8px 0; }
+  .legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--muted); padding: 8px 14px; border-top: 1px solid var(--border); }
+  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 4px; vertical-align: -1px; border: 2px solid; }
+
+  /* ── markers painted onto the diagram by the cockpit (fixed colours: the canvas is always light) ── */
+  .done:not(.djs-connection) .djs-visual > :nth-child(1) { stroke: #1f9d55 !important; fill: #e5f6ec !important; }
+  .taken.djs-connection .djs-visual > path { stroke: #1f9d55 !important; stroke-width: 2.5px !important; }
+  .active:not(.djs-connection) .djs-visual > :nth-child(1) { stroke: #2f6fdb !important; stroke-width: 3px !important; fill: #e8f0fd !important; }
+  .waiting:not(.djs-connection) .djs-visual > :nth-child(1) { stroke: #c77d10 !important; stroke-width: 3px !important; fill: #fdf3e2 !important; }
+  .incident:not(.djs-connection) .djs-visual > :nth-child(1) { stroke: #d64545 !important; stroke-width: 3px !important; fill: #fbe9e9 !important; }
+  .compensated:not(.djs-connection) .djs-visual > :nth-child(1) { stroke: #c77d10 !important; fill: #fdf3e2 !important; }
+  .caught:not(.djs-connection) .djs-visual > :nth-child(1) { stroke: #d64545 !important; fill: #fbe9e9 !important; }
+  .tok { font: 700 11px system-ui, sans-serif; color: #fff; border-radius: 999px; padding: 1px 7px; white-space: nowrap; box-shadow: 0 1px 3px rgba(0,0,0,.3); }
+  .tok.READY, .tok.EXECUTING { background: #2f6fdb; animation: pulse 1s infinite; }
+  .tok.WAITING { background: #c77d10; }
+  .tok.INCIDENT { background: #d64545; }
+  @keyframes pulse { 50% { opacity: .55; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Mini BPMN</h1>
+  <span class="sub">a teaching BPMN tool: <b>modeler</b> (draw &amp; deploy) → <b>engine</b> (runs tokens through the graph) → <b>cockpit</b> (watch &amp; operate instances)</span>
+</header>
+
+<div class="layout">
+  <aside>
+    <section class="panel">
+      <h2>Deployed processes</h2>
+      <div class="list" id="processes"><div class="empty pad">loading…</div></div>
+    </section>
+
+    <section class="panel">
+      <h2>Start an instance <span class="spacer"></span><span class="mono muted" id="startKey"></span></h2>
+      <div class="pad">
+        <div class="presets" id="presets"></div>
+        <textarea id="startVars" spellcheck="false">{}</textarea>
+        <div class="row" style="margin-top:8px">
+          <button class="btn" id="startBtn" disabled>Start</button>
+          <select id="startVersion" title="Which version to start. Callers normally start the latest; pinning an old one is how you keep a version alive."></select>
+          <span class="err" id="startErr"></span>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Instances</h2>
+      <div class="list instances" id="instances"><div class="empty pad">none yet</div></div>
+    </section>
+  </aside>
+
+  <main>
+    <section class="panel">
+      <div class="tabs">
+        <button class="tab on" data-tab="modeler">Modeler</button>
+        <button class="tab" data-tab="cockpit">Cockpit</button>
+      </div>
+
+      <!-- ───── Modeler ───── -->
+      <div id="tab-modeler">
+        <div class="toolbar">
+          <button class="btn ghost" id="newBtn">New diagram</button>
+          <button class="btn ghost" id="xmlBtn">Show XML</button>
+          <button class="btn ghost" id="downloadBtn">Download .bpmn</button>
+          <span class="spacer"></span>
+          <span class="muted" id="modelerTitle"></span>
+          <button class="btn" id="deployBtn">Deploy</button>
+        </div>
+        <div id="deployResult"></div>
+        <div class="modeler-wrap">
+          <div>
+            <div class="canvas" id="modeler"></div>
+            <textarea id="xmlBox" spellcheck="false"></textarea>
+          </div>
+          <div class="props" id="props"></div>
+        </div>
+      </div>
+
+      <!-- ───── Cockpit ───── -->
+      <div id="tab-cockpit" style="display:none">
+        <div class="toolbar">
+          <b id="instTitle" class="mono">no instance selected</b>
+          <span id="instStatus"></span>
+          <span class="spacer"></span>
+          <button class="btn bad small" id="cancelBtn" style="display:none">Cancel instance</button>
+        </div>
+        <div class="links" id="instLinks"></div>
+        <div class="canvas" id="viewer"></div>
+        <div class="legend">
+          <span><i style="border-color:#2f6fdb;background:#e8f0fd"></i>token executing</span>
+          <span><i style="border-color:#c77d10;background:#fdf3e2"></i>token waiting (user/receive task, timer, message, join, sub-process, call)</span>
+          <span><i style="border-color:#d64545;background:#fbe9e9"></i>incident / error caught</span>
+          <span><i style="border-color:#1f9d55;background:#e5f6ec"></i>completed / flow taken</span>
+          <span><i style="border-color:#c77d10;background:#fdf3e2"></i>compensation ran</span>
+        </div>
+      </div>
+    </section>
+
+    <div class="cockpit-grid" id="cockpitPanels" style="display:none">
+      <section class="panel">
+        <h2>Open work</h2>
+        <div class="pad" id="work"></div>
+      </section>
+      <section class="panel">
+        <h2>Process variables <span class="spacer"></span><button class="btn small ghost" id="editVarsBtn" style="display:none">Edit</button></h2>
+        <div class="pad">
+          <pre class="vars" id="vars"></pre>
+          <div id="varsEditor" style="display:none">
+            <textarea id="varsBox" spellcheck="false" style="width:100%;min-height:240px"></textarea>
+            <div class="row" style="margin-top:6px"><button class="btn small" id="saveVarsBtn">Save variables</button><button class="btn small ghost" id="cancelVarsBtn">Discard</button><span class="err" id="varsErr"></span></div>
+          </div>
+        </div>
+      </section>
+      <section class="panel" style="grid-column: 1 / -1" id="versionsPanel">
+        <h2>Versions &amp; migration</h2>
+        <div class="pad" id="versions"></div>
+      </section>
+      <section class="panel" style="grid-column: 1 / -1">
+        <h2>History (audit trail)</h2>
+        <div class="pad history" id="history"></div>
+      </section>
+    </div>
+  </main>
+</div>
+
+<!-- Two bpmn-js bundles: a read-only viewer for the cockpit and the full modeler. Both export `BpmnJS`. -->
+<script src="https://unpkg.com/bpmn-js@18.31.0/dist/bpmn-navigated-viewer.development.js"></script>
+<script>window.BpmnViewer = window.BpmnJS;</script>
+<script src="https://unpkg.com/bpmn-js@18.31.0/dist/bpmn-modeler.development.js"></script>
+<script>
+// ─────────────────────────── setup ───────────────────────────
+const $ = (s) => document.querySelector(s);
+const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const api = async (path, opts = {}) => {
+  const res = await fetch('/api' + path, { headers: { 'content-type': 'application/json' }, ...opts });
+  const text = await res.text();
+  const body = res.headers.get('content-type')?.includes('json') ? JSON.parse(text) : text;
+  if (!res.ok) throw Object.assign(new Error(body?.message ?? text), { body });
+  return body;
+};
+
+/**
+ * BPMN is extensible: vendors add their own attributes in their own XML namespace
+ * (Camunda uses zeebe:taskDefinition, Flowable uses flowable:class…). Teaching the
+ * modeler about ours makes mini:handler / mini:formFields survive editing and export.
+ */
+const MINI_MODDLE = {
+  name: 'Mini', uri: 'https://example.com/mini-bpmn', prefix: 'mini', xml: { tagAlias: 'lowerCase' }, associations: [],
+  types: [
+    { name: 'HandlerTask', extends: ['bpmn:ServiceTask'], properties: [{ name: 'handler', isAttr: true, type: 'String' }] },
+    { name: 'FormTask', extends: ['bpmn:UserTask'], properties: [{ name: 'formFields', isAttr: true, type: 'String' }] },
+    { name: 'VersionedProcess', extends: ['bpmn:Process'], properties: [{ name: 'versionTag', isAttr: true, type: 'String' }] },
+    { name: 'CorrelatedMessage', extends: ['bpmn:Message'], properties: [{ name: 'correlationKey', isAttr: true, type: 'String' }] },
+    { name: 'CalledProcess', extends: ['bpmn:CallActivity'], properties: ['calledElementBinding', 'calledElementVersion', 'calledElementVersionTag', 'inputs', 'outputs'].map((name) => ({ name, isAttr: true, type: 'String' })) },
+    { name: 'Loop', extends: ['bpmn:MultiInstanceLoopCharacteristics'], properties: ['collection', 'elementVariable', 'outputCollection', 'outputElement'].map((name) => ({ name, isAttr: true, type: 'String' })) },
+  ],
+};
+const modeler = new BpmnJS({ container: '#modeler', moddleExtensions: { mini: MINI_MODDLE } });
+const viewer = new BpmnViewer({ container: '#viewer', moddleExtensions: { mini: MINI_MODDLE } });
+
+const PRESETS = {
+  'quote-approval': [
+    ['Small quote (auto-approved)', { shipment: { containers: 2 } }],
+    ['Big quote (manager must approve)', { shipment: { containers: 6 } }],
+  ],
+  'shipment-saga': [
+    ['Happy path', {}],
+    ['Customs rejects', { shipment: { hsCode: '930100' } }],
+    ['Not enough trucks', { shipment: { containers: 6 } }],
+    ['No warehouse in city', { shipment: { finalDestinationCity: 'Berlin' } }],
+    ['Credit limit (pivot fails)', { shipment: { customerId: 'tiny-traders' } }],
+    ['Timeout → incident', { shipment: { simulate: { slowReplyAt: 'trucking' } } }],
+    ['Flaky compensation → incident', { shipment: { simulate: { failAt: 'billing', flakyCompensationAt: 'customs' } } }],
+  ],
+  'import-shipment': [
+    ['Low risk, 3 containers', { shipment: { containers: 3 } }],
+    ['High value → compliance review (reminder 20s, escalation 45s)', { shipment: { cargoValueEur: 300000 } }],
+    ['Embargoed origin → refused', { shipment: { originPort: 'IRBND' } }],
+    ['No warehouse → sub-process error, undo ocean', { shipment: { finalDestinationCity: 'Berlin' } }],
+    ['Pin customs release 2026.1 (v1)', { customsRelease: '2026.1', shipment: { containers: 2 } }],
+    ['Credit limit → collect payment manually', { shipment: { customerId: 'tiny-traders', containers: 3 } }],
+  ],
+  'customs-clearance': [
+    ['Standalone clearance', { shipment: { hsCode: '854143', cargoValueEur: 120000 } }],
+  ],
+};
+
+/** Ready-made message payloads for the "send message" buttons. */
+const MESSAGE_PAYLOADS = { AddressChanged: { newAddress: 'Hafenstr. 1, 47119 Duisburg' }, VesselArrived: { berth: 'ECT Delta' } };
+
+const NEW_DIAGRAM = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:mini="https://example.com/mini-bpmn" id="Definitions_new" targetNamespace="https://example.com/mini-bpmn">
+  <bpmn:process id="my-process" name="My process" isExecutable="true">
+    <bpmn:startEvent id="StartEvent_1" name="Start" />
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="Diagram_1">
+    <bpmndi:BPMNPlane id="Plane_1" bpmnElement="my-process">
+      <bpmndi:BPMNShape id="StartEvent_1_di" bpmnElement="StartEvent_1"><dc:Bounds x="152" y="182" width="36" height="36" /></bpmndi:BPMNShape>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>`;
+
+const state = { processes: [], selectedKey: null, instanceId: null, instance: null, viewerDef: null, handlers: [] };
+
+// ─────────────────────────── tabs ───────────────────────────
+function showTab(name) {
+  document.querySelectorAll('.tab').forEach((t) => t.classList.toggle('on', t.dataset.tab === name));
+  $('#tab-modeler').style.display = name === 'modeler' ? '' : 'none';
+  $('#tab-cockpit').style.display = name === 'cockpit' ? '' : 'none';
+  $('#cockpitPanels').style.display = name === 'cockpit' ? '' : 'none';
+  // bpmn-js measures its container; re-fit after it becomes visible.
+  setTimeout(() => {
+    const bpmn = name === 'cockpit' ? viewer : modeler;
+    bpmn.get('canvas').resized();
+    if (needsFit.has(bpmn)) fit(bpmn);
+  }, 0);
+}
+
+// Zooming a hidden canvas yields NaN; remember to fit once it is visible.
+const needsFit = new Set();
+function fit(bpmn) {
+  const canvas = bpmn.get('canvas');
+  if (!canvas.getContainer().clientWidth) return needsFit.add(bpmn);
+  needsFit.delete(bpmn);
+  canvas.zoom('fit-viewport', 'auto');
+  // Leave a margin for labels, and keep the modeler's palette from covering the diagram.
+  canvas.zoom(canvas.zoom() * (bpmn === modeler ? 0.8 : 0.94), 'auto');
+  if (bpmn === modeler) canvas.scroll({ dx: 70, dy: 0 });
+}
+document.querySelectorAll('.tab').forEach((t) => (t.onclick = () => showTab(t.dataset.tab)));
+
+// ─────────────────────────── processes & starting ───────────────────────────
+async function loadProcesses() {
+  const all = await api('/processes');
+  const latest = new Map();
+  for (const d of all) if (!latest.has(d.key)) latest.set(d.key, { ...d, versions: all.filter((x) => x.key === d.key) });
+  state.processes = [...latest.values()];
+  // Every version stays deployed: instances started on it keep running on it until they end or are migrated.
+  const chip = (v) => `<span class="pill tag" title="${v.running} running instance(s)">v${v.version}${v.versionTag ? ' · ' + esc(v.versionTag) : ''}${v.running ? ` · ${v.running}▶` : ''}</span>`;
+  $('#processes').innerHTML = state.processes.map((p) => `
+    <div class="item ${p.key === state.selectedKey ? 'sel' : ''}">
+      <div class="row"><b>${esc(p.name)}</b></div>
+      <div class="meta mono">${esc(p.key)}</div>
+      <div class="versions-list">${p.versions.map(chip).join('')}</div>
+      <div class="row" style="margin-top:4px">
+        <button class="btn small ghost" data-open="${esc(p.key)}">Open in modeler</button>
+        <button class="btn small" data-select="${esc(p.key)}">Select to start</button>
+      </div>
+    </div>`).join('') || '<div class="empty pad">nothing deployed</div>';
+  document.querySelectorAll('[data-open]').forEach((b) => (b.onclick = () => openInModeler(b.dataset.open)));
+  document.querySelectorAll('[data-select]').forEach((b) => (b.onclick = () => selectProcess(b.dataset.select)));
+  if (!state.selectedKey && state.processes.length) selectProcess(state.processes.find((p) => p.key === 'shipment-saga')?.key ?? state.processes[0].key);
+}
+
+function selectProcess(key) {
+  state.selectedKey = key;
+  $('#startKey').textContent = key;
+  $('#startBtn').disabled = false;
+  const versions = state.processes.find((p) => p.key === key)?.versions ?? [];
+  $('#startVersion').innerHTML = `<option value="">latest (v${versions[0]?.version ?? '?'})</option>` +
+    versions.map((v) => `<option value="${v.version}">v${v.version}${v.versionTag ? ' · ' + esc(v.versionTag) : ''}</option>`).join('');
+  const presets = PRESETS[key] ?? [['Empty', {}]];
+  $('#presets').innerHTML = presets.map(([label], i) => `<button data-preset="${i}">${esc(label)}</button>`).join('');
+  document.querySelectorAll('[data-preset]').forEach((b) => (b.onclick = () => ($('#startVars').value = JSON.stringify(presets[b.dataset.preset][1], null, 2))));
+  $('#startVars').value = JSON.stringify(presets[0][1], null, 2);
+  document.querySelectorAll('#processes .item').forEach((el) => el.classList.toggle('sel', el.querySelector('[data-select]')?.dataset.select === key));
+}
+
+$('#startBtn').onclick = async () => {
+  $('#startErr').textContent = '';
+  try {
+    const variables = JSON.parse($('#startVars').value || '{}');
+    const version = Number($('#startVersion').value) || undefined;
+    const inst = await api(`/processes/${encodeURIComponent(state.selectedKey)}/start`, { method: 'POST', body: JSON.stringify({ variables, version }) });
+    showTab('cockpit');
+    await selectInstance(inst.id);
+    loadInstances();
+  } catch (e) {
+    $('#startErr').textContent = e.message;
+  }
+};
+
+// ─────────────────────────── modeler ───────────────────────────
+async function openInModeler(key) {
+  const xml = await api(`/processes/${encodeURIComponent(key)}/xml`);
+  await importIntoModeler(xml);
+  showTab('modeler');
+}
+
+async function importIntoModeler(xml) {
+  await modeler.importXML(xml);
+  fit(modeler);
+  const root = modeler.get('canvas').getRootElement().businessObject;
+  $('#modelerTitle').innerHTML = `editing <span class="mono">${esc(root.id)}</span>`;
+  $('#deployResult').style.display = 'none';
+  renderProps(null);
+}
+
+$('#newBtn').onclick = () => importIntoModeler(NEW_DIAGRAM);
+
+$('#xmlBtn').onclick = async () => {
+  const box = $('#xmlBox');
+  if (box.style.display === 'block') {
+    // Leaving XML view: apply any hand edits back into the diagram.
+    try { await importIntoModeler(box.value); } catch (e) { return showDeploy(false, 'XML could not be imported: ' + e.message); }
+    box.style.display = 'none'; $('#modeler').style.display = ''; $('#xmlBtn').textContent = 'Show XML';
+  } else {
+    box.value = (await modeler.saveXML({ format: true })).xml;
+    box.style.display = 'block'; $('#modeler').style.display = 'none'; $('#xmlBtn').textContent = 'Back to diagram (applies edits)';
+  }
+};
+
+$('#downloadBtn').onclick = async () => {
+  const { xml } = await modeler.saveXML({ format: true });
+  const id = modeler.get('canvas').getRootElement().businessObject.id;
+  const a = Object.assign(document.createElement('a'), { href: URL.createObjectURL(new Blob([xml], { type: 'application/xml' })), download: `${id}.bpmn` });
+  a.click();
+};
+
+$('#deployBtn').onclick = async () => {
+  const xml = $('#xmlBox').style.display === 'block' ? $('#xmlBox').value : (await modeler.saveXML({ format: true })).xml;
+  try {
+    const d = await api('/processes', { method: 'POST', body: JSON.stringify({ xml }) });
+    showDeploy(true, `Deployed ${d.key} as version ${d.version}. New instances use it; running instances keep their version.`);
+    await loadProcesses();
+    selectProcess(d.key);
+  } catch (e) {
+    showDeploy(false, 'The engine refused the diagram:\n • ' + (e.body?.problems ?? [e.message]).join('\n • '));
+  }
+};
+
+function showDeploy(ok, text) {
+  const el = $('#deployResult');
+  el.style.display = 'block';
+  el.className = ok ? '' : 'err';
+  el.style.color = ok ? 'var(--ok)' : '';
+  el.textContent = text;
+}
+
+// A tiny properties panel. (The real one is the `bpmn-js-properties-panel` package.)
+modeler.on('selection.changed', ({ newSelection }) => renderProps(newSelection.length === 1 ? newSelection[0] : null));
+modeler.on('element.changed', ({ element }) => {
+  const sel = modeler.get('selection').get();
+  if (sel.length === 1 && sel[0] === element && !document.activeElement?.closest('#props')) renderProps(element);
+});
+
+function renderProps(element) {
+  const modeling = modeler.get('modeling');
+  const moddle = modeler.get('moddle');
+  const canvas = modeler.get('canvas');
+  const el = element ?? canvas.getRootElement();
+  const bo = el?.businessObject;
+  if (!bo) return ($('#props').innerHTML = ''); // fired mid-import, before the diagram exists
+  const type = bo.$type.replace('bpmn:', '');
+  const eventDef = bo.eventDefinitions?.[0];
+  const parts = [`<div><span class="type">${esc(type)}${eventDef ? ' · ' + esc(eventDef.$type.replace('bpmn:', '')) : ''}</span><div class="hint mono">${esc(bo.id)}</div></div>`];
+
+  if (type === 'Process') {
+    parts.push(field('procId', 'Process key (id)', bo.id), field('name', 'Name', bo.name), field('versionTag', 'mini:versionTag', bo.versionTag));
+    parts.push(`<div class="hint">Nothing selected: these are the process' own properties. The key is what you start instances by; deploying the same key again creates a new version. The version tag is a label you choose (e.g. <code>2026.3</code>) that call activities can bind to.</div>`);
+  } else {
+    parts.push(field('name', 'Name', bo.name));
+  }
+  if (type === 'ServiceTask') {
+    parts.push(field('handler', 'mini:handler (code to run)', bo.handler, 'handlers'));
+    parts.push(`<datalist id="handlers">${state.handlers.map((h) => `<option value="${esc(h)}">`).join('')}</datalist>`);
+    if (bo.isForCompensation) parts.push(`<div class="hint">isForCompensation: only runs to undo the activity it is associated with.</div>`);
+  }
+  if (type === 'UserTask') parts.push(field('formFields', 'mini:formFields', bo.formFields), `<div class="hint">e.g. <code>approved:boolean,comment:string</code></div>`);
+  if (type === 'SequenceFlow') {
+    parts.push(field('condition', 'Condition', bo.conditionExpression?.body), `<div class="hint">JavaScript over process variables, e.g. <code>\${quote.amount > 10000}</code></div>`);
+    if (bo.sourceRef.$type === 'bpmn:ExclusiveGateway') {
+      parts.push(`<label class="check"><input type="checkbox" id="p-default" ${bo.sourceRef.default === bo ? 'checked' : ''}> default flow (taken when no condition is true)</label>`);
+    }
+  }
+  if (eventDef?.$type === 'bpmn:TimerEventDefinition') parts.push(field('timer', 'Timer duration (ISO-8601)', eventDef.timeDuration?.body), `<div class="hint">e.g. <code>PT10S</code>, <code>PT1M</code></div>`);
+  if (eventDef?.$type === 'bpmn:ErrorEventDefinition') parts.push(`<div class="hint">Catches error code <code>${esc(eventDef.errorRef?.errorCode ?? 'any')}</code>. Handlers raise it with <code>throw new BpmnError(code)</code>.</div>`);
+  if (type === 'CallActivity') {
+    parts.push(field('calledElement', 'calledElement (process key)', bo.calledElement));
+    parts.push(`<label>mini:calledElementBinding<select id="p-binding">${['latest', 'version', 'versionTag'].map((b) => `<option ${(bo.calledElementBinding ?? 'latest') === b ? 'selected' : ''}>${b}</option>`).join('')}</select></label>`);
+    if (bo.calledElementBinding === 'version') parts.push(field('calledVersion', 'mini:calledElementVersion', bo.calledElementVersion));
+    if (bo.calledElementBinding === 'versionTag') parts.push(field('calledTag', 'mini:calledElementVersionTag', bo.calledElementVersionTag));
+    parts.push(field('inputs', 'mini:inputs (variables passed in; empty = all)', bo.inputs), field('outputs', 'mini:outputs (variables copied back; empty = all)', bo.outputs));
+    parts.push(`<div class="hint">Starts a separate instance of another process and waits for it. <code>latest</code> picks the newest version at call time; <code>versionTag</code> pins a release such as <code>\${customsRelease}</code>. A BPMN error the called process doesn't catch ends up on this activity's error boundary.</div>`);
+  }
+  const loop = bo.loopCharacteristics?.$type === 'bpmn:MultiInstanceLoopCharacteristics' ? bo.loopCharacteristics : null;
+  if (loop) {
+    parts.push(`<div class="type">multi-instance · ${loop.isSequential ? 'sequential' : 'parallel'}</div>`);
+    parts.push(field('collection', 'mini:collection (a list)', loop.collection), field('elementVariable', 'mini:elementVariable', loop.elementVariable));
+    parts.push(field('outputCollection', 'mini:outputCollection', loop.outputCollection), field('outputElement', 'mini:outputElement', loop.outputElement));
+    parts.push(`<div class="hint">Runs once per item of e.g. <code>\${containerList}</code>; each run sees its item as the element variable plus <code>loopCounter</code>. Switch parallel/sequential with the wrench menu.</div>`);
+  }
+  const message = eventDef?.$type === 'bpmn:MessageEventDefinition' ? eventDef.messageRef : type === 'ReceiveTask' ? bo.messageRef : undefined;
+  if (eventDef?.$type === 'bpmn:MessageEventDefinition' || type === 'ReceiveTask') {
+    parts.push(field('messageName', 'Message name', message?.name), field('correlationKey', 'mini:correlationKey (on the message)', message?.correlationKey));
+    parts.push(`<div class="hint">Waits until <code>POST /api/messages {name, correlationKey}</code> arrives. The key is evaluated when the token starts waiting, e.g. <code>\${shipmentRef}</code>.</div>`);
+  }
+  if (type === 'BoundaryEvent' && eventDef && !['bpmn:CompensateEventDefinition', 'bpmn:ErrorEventDefinition'].includes(eventDef.$type)) {
+    parts.push(`<div class="hint">${bo.cancelActivity === false ? '<b>Non-interrupting</b>: the activity keeps going and a new token runs this path alongside it.' : '<b>Interrupting</b>: cancels the activity (and everything inside it) and continues here.'} Toggle it with the wrench menu.</div>`);
+  }
+  if (type === 'EventBasedGateway') parts.push(`<div class="hint">Waits for whichever of the following events happens first (messages or timers); the others are dropped.</div>`);
+  if (type === 'SubProcess') parts.push(`<div class="hint">A scope with its own start and end. One error boundary on it catches errors from every task inside; an interrupting boundary cancels everything inside.</div>`);
+  if (type === 'ParallelGateway') parts.push(`<div class="hint">Fork: one token per outgoing flow. Join: waits for a token on every incoming flow.</div>`);
+  if (type === 'ExclusiveGateway') parts.push(`<div class="hint">Exactly one outgoing flow is taken: the first whose condition is true, else the default.</div>`);
+
+  $('#props').innerHTML = parts.join('');
+
+  const on = (id, fn) => { const input = $('#p-' + id); if (input) input.onchange = () => fn(input.type === 'checkbox' ? input.checked : input.value.trim()); };
+  on('name', (v) => (type === 'Process' ? modeling.updateProperties(el, { name: v || undefined }) : modeling.updateLabel(el, v)));
+  on('procId', (v) => v && modeling.updateProperties(el, { id: v }));
+  on('versionTag', (v) => modeling.updateProperties(el, { 'mini:versionTag': v || undefined }));
+  on('calledElement', (v) => modeling.updateProperties(el, { calledElement: v || undefined }));
+  on('binding', (v) => { modeling.updateProperties(el, { 'mini:calledElementBinding': v === 'latest' ? undefined : v }); renderProps(el); });
+  on('calledVersion', (v) => modeling.updateProperties(el, { 'mini:calledElementVersion': v || undefined }));
+  on('calledTag', (v) => modeling.updateProperties(el, { 'mini:calledElementVersionTag': v || undefined }));
+  on('inputs', (v) => modeling.updateProperties(el, { 'mini:inputs': v || undefined }));
+  on('outputs', (v) => modeling.updateProperties(el, { 'mini:outputs': v || undefined }));
+  for (const key of ['collection', 'elementVariable', 'outputCollection', 'outputElement']) {
+    on(key, (v) => modeling.updateModdleProperties(el, loop, { [key]: v || undefined }));
+  }
+  // Messages are defined once at the top of the file and referenced by id; create one on first use.
+  const ensureMessage = () => {
+    if (message) return message;
+    const definitions = modeler.getDefinitions();
+    const created = moddle.create('bpmn:Message', { id: 'Msg_' + Math.random().toString(36).slice(2, 8) });
+    created.$parent = definitions;
+    definitions.rootElements.push(created);
+    if (eventDef) modeling.updateModdleProperties(el, eventDef, { messageRef: created });
+    else modeling.updateProperties(el, { messageRef: created });
+    return created;
+  };
+  on('messageName', (v) => modeling.updateModdleProperties(el, ensureMessage(), { name: v || undefined }));
+  on('correlationKey', (v) => modeling.updateModdleProperties(el, ensureMessage(), { correlationKey: v || undefined }));
+  on('handler', (v) => modeling.updateProperties(el, { 'mini:handler': v || undefined }));
+  on('formFields', (v) => modeling.updateProperties(el, { 'mini:formFields': v || undefined }));
+  on('condition', (v) => modeling.updateProperties(el, { conditionExpression: v ? moddle.create('bpmn:FormalExpression', { body: v }) : undefined }));
+  on('default', (checked) => {
+    const gateway = modeler.get('elementRegistry').get(bo.sourceRef.id);
+    modeling.updateProperties(gateway, { default: checked ? bo : undefined });
+  });
+  on('timer', (v) => modeling.updateModdleProperties(el, eventDef, { timeDuration: moddle.create('bpmn:FormalExpression', { body: v }) }));
+}
+
+function field(id, label, value, list) {
+  return `<label>${esc(label)}<input type="text" id="p-${id}" value="${esc(value ?? '')}" ${list ? `list="${list}"` : ''}></label>`;
+}
+
+// ─────────────────────────── instances & cockpit ───────────────────────────
+async function loadInstances() {
+  const all = await api('/instances');
+  const short = (id) => id.slice(0, 8);
+  $('#instances').innerHTML = all.map((i) => `
+    <button class="item ${i.id === state.instanceId ? 'sel' : ''}" data-inst="${i.id}">
+      <div class="row"><b class="mono">${i.parentInstanceId ? '↳ ' : ''}${short(i.id)}</b><span class="pill ${i.status}">${i.status}</span>${i.incidents ? `<span class="pill incident">${i.incidents} incident</span>` : ''}</div>
+      <div class="meta">${esc(i.definitionKey)} v${i.definitionVersion} · ${new Date(i.createdAt).toLocaleTimeString()}${i.parentInstanceId ? ' · called by ' + short(i.parentInstanceId) : ''}${i.waiting.length ? ' · waiting at ' + esc(i.waiting.join(', ')) : ''}</div>
+    </button>`).join('') || '<div class="empty pad">none yet</div>';
+  document.querySelectorAll('[data-inst]').forEach((b) => (b.onclick = () => { showTab('cockpit'); selectInstance(b.dataset.inst); }));
+}
+
+async function selectInstance(id) {
+  if (id !== state.instanceId) setEditingVars(false);
+  state.instanceId = id;
+  document.querySelectorAll('[data-inst]').forEach((b) => b.classList.toggle('sel', b.dataset.inst === id));
+  await refreshInstance();
+}
+
+async function refreshInstance() {
+  if (!state.instanceId) return;
+  const inst = await api(`/instances/${state.instanceId}`);
+  state.instance = inst;
+  // The cockpit draws the EXACT version the instance runs on, not the latest one.
+  const defKey = `${inst.definitionKey}@${inst.definitionVersion}`;
+  if (state.viewerDef !== defKey) {
+    const xml = await api(`/processes/${encodeURIComponent(inst.definitionKey)}/xml?version=${inst.definitionVersion}`);
+    await viewer.importXML(xml);
+    painted = []; // markers belonged to the previous diagram
+    fit(viewer);
+    state.viewerDef = defKey;
+  }
+  paintDiagram(inst);
+  renderInstancePanels(inst);
+}
+
+let painted = [];
+function paintDiagram(inst) {
+  const canvas = viewer.get('canvas');
+  const overlays = viewer.get('overlays');
+  const registry = viewer.get('elementRegistry');
+  painted.forEach(([id, m]) => canvas.removeMarker(id, m));
+  painted = [];
+  overlays.remove({ type: 'token' });
+  const mark = (id, m) => { if (registry.get(id)) { canvas.addMarker(id, m); painted.push([id, m]); } };
+
+  for (const h of inst.history) {
+    if (h.type === 'node-completed') mark(h.nodeId, 'done');
+    if (h.type === 'flow-taken') mark(h.flowId, 'taken');
+    if (h.type === 'compensated') mark(h.nodeId, 'compensated');
+    if (h.type === 'error-caught') mark(h.nodeId, 'caught');
+  }
+  // Tokens: where execution is RIGHT NOW.
+  const byNode = {};
+  for (const t of inst.tokens) (byNode[t.nodeId] ??= []).push(t);
+  for (const [nodeId, tokens] of Object.entries(byNode)) {
+    const worst = ['INCIDENT', 'EXECUTING', 'READY', 'WAITING'].find((s) => tokens.some((t) => t.state === s));
+    mark(nodeId, worst === 'INCIDENT' ? 'incident' : worst === 'WAITING' ? 'waiting' : 'active');
+    if (!registry.get(nodeId)) continue;
+    overlays.add(nodeId, 'token', {
+      position: { top: -12, right: 10 },
+      html: `<div class="tok ${worst}" title="${esc(tokens.map((t) => `${t.id}: ${t.state}`).join('\n'))}">${tokens.length > 1 ? tokens.length + ' tokens' : worst.toLowerCase()}</div>`,
+    });
+  }
+}
+
+let lastWorkHtml = '';
+function renderInstancePanels(inst) {
+  $('#instTitle').textContent = `${inst.definitionKey} v${inst.definitionVersion}${inst.versionTag ? ' (' + inst.versionTag + ')' : ''} · ${inst.id.slice(0, 8)}`;
+  const incidents = inst.tokens.filter((t) => t.state === 'INCIDENT');
+  $('#instStatus').innerHTML = `<span class="pill ${inst.status}">${inst.status}</span>${incidents.length ? ` <span class="pill incident">${incidents.length} incident</span>` : ''}`;
+  $('#cancelBtn').style.display = inst.status === 'RUNNING' ? '' : 'none';
+
+  // Parent and child instances: a call activity runs another process as a separate instance.
+  const links = [];
+  if (inst.parentInstanceId) links.push(`called by <button class="linkbtn" data-goto="${inst.parentInstanceId}">${inst.parentInstanceId.slice(0, 8)}</button>`);
+  if (inst.children.length) links.push('calls ' + inst.children.map((c) => `<button class="linkbtn" data-goto="${c.id}">${esc(c.definitionKey)} v${c.definitionVersion} · ${c.id.slice(0, 8)}</button> <span class="pill ${c.status}">${c.status}</span>`).join(' '));
+  if (inst.endError) links.push(`<span class="err">ended by BPMN error ${esc(inst.endError.code)}: ${esc(inst.endError.message)}</span>`);
+  $('#instLinks').innerHTML = links.join(' · ');
+  document.querySelectorAll('[data-goto]').forEach((b) => (b.onclick = () => selectInstance(b.dataset.goto)));
+
+  const work = [];
+  for (const task of inst.userTasks) {
+    const inputs = task.formFields.map((f) => f.type === 'boolean'
+      ? `<label><input type="checkbox" name="${esc(f.name)}" data-type="boolean"> ${esc(f.name)}</label>`
+      : `<label>${esc(f.name)} <input name="${esc(f.name)}" data-type="${f.type}" ${f.type === 'number' ? 'type="number"' : ''}></label>`).join('');
+    // A multi-instance task shows one card per item, each with its own form.
+    const iteration = task.iteration ? `<div class="sub">item #${task.iteration.index + 1}: <code>${esc(JSON.stringify(task.iteration.item))}</code></div>` : '';
+    work.push(`<div class="card"><h3>👤 User task: ${esc(task.name)}</h3>${iteration}
+      <form data-task="${task.tokenId}">${inputs || '<span class="muted">no form fields</span>'}<div><button class="btn small">Complete task</button></div></form></div>`);
+  }
+  for (const t of incidents) {
+    work.push(`<div class="card incident"><h3>⚠ Incident at ${esc(t.nodeId)}</h3><div class="err">${esc(t.incident)}</div>
+      <div class="muted" style="font-size:12px;margin:6px 0">A technical failure the diagram doesn't model. Fix the cause (start the service, or edit the variables), then retry.</div>
+      <button class="btn small warn" data-retry="${t.id}">Retry</button></div>`);
+  }
+  // Messages: in real life another system sends them (POST /api/messages); here a button does.
+  inst.subscriptions.filter((s) => s.kind === 'message').forEach((s, i) => {
+    const payload = JSON.stringify(MESSAGE_PAYLOADS[s.messageName] ?? {});
+    work.push(`<div class="card msg"><h3>✉ Waiting for message <code>${esc(s.messageName)}</code></h3>
+      <div class="sub">at "${esc(s.waitingAt)}"${s.eventName !== s.waitingAt ? ` → "${esc(s.eventName)}"` : ''}${s.interrupting === false ? ' (non-interrupting)' : s.interrupting ? ' (interrupting)' : ''} · correlation key <code>${esc(s.correlationKey ?? '—')}</code></div>
+      <form data-msg="${i}" data-name="${esc(s.messageName)}" data-key="${esc(s.correlationKey ?? '')}"><textarea spellcheck="false" title="message variables (JSON)">${esc(payload)}</textarea>
+      <div><button class="btn small">Send ${esc(s.messageName)}</button></div></form></div>`);
+  });
+  for (const s of inst.subscriptions.filter((x) => x.kind === 'timer')) {
+    work.push(`<div class="card"><h3>⏱ Timer "${esc(s.eventName)}"</h3><span class="muted">${s.interrupting === false ? 'non-interrupting · ' : s.interrupting ? 'interrupting · ' : ''}fires in <span data-due="${s.dueAt}"></span></span></div>`);
+  }
+  const html = work.join('') || `<div class="empty">${inst.status === 'RUNNING' ? 'nothing for a human to do right now' : 'instance is ' + inst.status.toLowerCase()}</div>`;
+  // Only redraw when something changed, so a half-filled form survives live updates.
+  if (html !== lastWorkHtml) {
+    lastWorkHtml = html;
+    $('#work').innerHTML = html;
+    document.querySelectorAll('[data-task]').forEach((form) => (form.onsubmit = async (e) => {
+      e.preventDefault();
+      const variables = {};
+      form.querySelectorAll('input').forEach((i) => {
+        variables[i.name] = i.dataset.type === 'boolean' ? i.checked : i.dataset.type === 'number' ? Number(i.value) : i.value;
+      });
+      await api(`/instances/${inst.id}/tasks/${form.dataset.task}/complete`, { method: 'POST', body: JSON.stringify({ variables }) }).catch((err) => alert(err.message));
+    }));
+    document.querySelectorAll('[data-retry]').forEach((b) => (b.onclick = () => api(`/instances/${inst.id}/incidents/${b.dataset.retry}/retry`, { method: 'POST' }).catch((err) => alert(err.message))));
+    document.querySelectorAll('[data-msg]').forEach((form) => (form.onsubmit = async (e) => {
+      e.preventDefault();
+      try {
+        const variables = JSON.parse(form.querySelector('textarea').value || '{}');
+        const body = { name: form.dataset.name, correlationKey: form.dataset.key || undefined, variables };
+        const r = await api('/messages', { method: 'POST', body: JSON.stringify(body) });
+        if (!r.correlated.length) alert('No instance was waiting for this message any more.');
+      } catch (err) { alert(err.message); }
+    }));
+  }
+  tickTimers();
+
+  $('#vars').textContent = JSON.stringify(inst.variables, null, 2);
+  $('#editVarsBtn').style.display = inst.status === 'RUNNING' && !editingVars ? '' : 'none';
+  if (inst.status !== 'RUNNING') setEditingVars(false);
+  const start = new Date(inst.history[0]?.at ?? inst.createdAt).getTime();
+  $('#history').innerHTML = inst.history.map((h) => `
+    <div class="h ${h.type}"><span class="t">+${((new Date(h.at).getTime() - start) / 1000).toFixed(1)}s</span><span class="k">${esc(h.type)}</span>
+    <span>${h.nodeId ? `<code>${esc(h.nodeId)}</code> ` : ''}${esc(h.message)}</span></div>`).join('');
+  $('#history').scrollTop = $('#history').scrollHeight;
+  renderVersions(inst);
+}
+
+// ─────────────────────────── versions & migration ───────────────────────────
+/** Mappings a migration between two versions needs, when a node was replaced (shipped with the sample files). */
+const SUGGESTED_MAPPINGS = { 'customs-clearance@1>2': { Wait_Release: 'Gw_Decision' } };
+
+let versionsFor = '';
+async function renderVersions(inst) {
+  const versions = state.processes.find((p) => p.key === inst.definitionKey)?.versions ?? [];
+  const others = versions.filter((v) => v.version !== inst.definitionVersion);
+  // Rebuild only when the instance, its version or its status changes: keeps the mapping you typed.
+  const signature = `${inst.id}@${inst.definitionVersion}@${inst.status}@${versions.map((v) => v.version).join()}`;
+  if (signature === versionsFor) return;
+  versionsFor = signature;
+  const current = versions.find((v) => v.version === inst.definitionVersion);
+  const tag = (v) => `v${v.version}${v.versionTag ? ' (' + esc(v.versionTag) + ')' : ''}`;
+  if (!others.length || inst.status !== 'RUNNING') {
+    $('#versions').innerHTML = `<div class="empty">Runs on ${current ? tag(current) : 'v' + inst.definitionVersion}. ${inst.status !== 'RUNNING' ? 'Only running instances can be migrated.' : 'This process has a single version; deploy a change from the modeler to get v2.'}</div>`;
+    return;
+  }
+  const target = others[0];
+  $('#versions').innerHTML = `
+    <div class="mig-grid">
+      <div>
+        <div class="row"><span>Runs on <b>${current ? tag(current) : 'v' + inst.definitionVersion}</b>. Move it to</span>
+          <select id="migTarget">${others.map((v) => `<option value="${v.version}">${tag(v)}</option>`).join('')}</select></div>
+        <div class="muted" style="font-size:12px;margin:8px 0 4px">Mapping for nodes that don't exist in the target (old id → new id, JSON):</div>
+        <textarea id="migMapping" spellcheck="false"></textarea>
+        <div class="row" style="margin-top:6px">
+          <button class="btn small ghost" id="migDry">Dry run</button>
+          <button class="btn small" id="migGo">Migrate this instance</button>
+          <button class="btn small ghost" id="migAll" title="every RUNNING instance of v${inst.definitionVersion}">Migrate all running v${inst.definitionVersion}</button>
+        </div>
+        <div id="migResult" style="margin-top:6px"></div>
+      </div>
+      <div><div class="muted" style="font-size:12px;margin-bottom:4px">What changed between the versions:</div><div class="diff" id="migDiff">…</div></div>
+    </div>`;
+  const targetVersion = () => Number($('#migTarget').value);
+  const loadDiff = async () => {
+    const v = targetVersion();
+    $('#migMapping').value = JSON.stringify(SUGGESTED_MAPPINGS[`${inst.definitionKey}@${inst.definitionVersion}>${v}`] ?? {}, null, 1);
+    const d = await api(`/processes/${encodeURIComponent(inst.definitionKey)}/diff?from=${inst.definitionVersion}&to=${v}`);
+    const line = (cls, sign, n) => `<div class="${cls}">${sign} ${esc(n.id)} <span class="muted">${esc(n.type)}${n.name ? ' "' + esc(n.name) + '"' : ''}</span></div>`;
+    $('#migDiff').innerHTML = [
+      ...d.added.map((n) => line('add', '+', n)),
+      ...d.removed.map((n) => line('del', '−', n)),
+      ...d.changed.map((c) => line('chg', '~', c.to)),
+    ].join('') || '<div class="muted">no node changes (only layout, conditions or flows)</div>';
+  };
+  const run = async (path, extra) => {
+    $('#migResult').innerHTML = '';
+    try {
+      const mapping = JSON.parse($('#migMapping').value || '{}');
+      const r = await api(path, { method: 'POST', body: JSON.stringify({ targetVersion: targetVersion(), mapping, ...extra }) });
+      const results = r.results ?? [r];
+      const failed = results.filter((x) => !x.ok);
+      const verb = extra.dryRun ? 'would migrate' : 'migrated';
+      $('#migResult').innerHTML = `<div class="ok-text">${verb} ${results.length - failed.length} of ${results.length} instance(s)</div>` +
+        failed.map((x) => `<div class="err">${x.instanceId.slice(0, 8)}:\n • ${x.problems.map(esc).join('\n • ')}</div>`).join('');
+    } catch (e) {
+      $('#migResult').innerHTML = `<div class="err">${esc(e.message)}</div>`;
+    }
+  };
+  $('#migTarget').onchange = loadDiff;
+  $('#migDry').onclick = () => run(`/instances/${inst.id}/migrate`, { dryRun: true });
+  $('#migGo').onclick = () => run(`/instances/${inst.id}/migrate`, {});
+  $('#migAll').onclick = () => confirm(`Migrate every running v${inst.definitionVersion} instance of ${inst.definitionKey}?`) &&
+    run(`/processes/${encodeURIComponent(inst.definitionKey)}/migrate`, { fromVersion: inst.definitionVersion });
+  loadDiff().catch((e) => ($('#migDiff').textContent = e.message));
+}
+
+// Operators may fix data before retrying an incident (Camunda Operate can do the same).
+let editingVars = false;
+function setEditingVars(on) {
+  editingVars = on;
+  $('#varsEditor').style.display = on ? '' : 'none';
+  $('#vars').style.display = on ? 'none' : '';
+  $('#editVarsBtn').style.display = on || state.instance?.status !== 'RUNNING' ? 'none' : '';
+  $('#varsErr').textContent = '';
+  if (on) $('#varsBox').value = JSON.stringify(state.instance.variables, null, 2);
+}
+$('#editVarsBtn').onclick = () => setEditingVars(true);
+$('#cancelVarsBtn').onclick = () => setEditingVars(false);
+$('#saveVarsBtn').onclick = async () => {
+  try {
+    const variables = JSON.parse($('#varsBox').value);
+    await api(`/instances/${state.instanceId}/variables`, { method: 'PUT', body: JSON.stringify({ variables }) });
+    setEditingVars(false);
+  } catch (e) {
+    $('#varsErr').textContent = e.message;
+  }
+};
+
+function tickTimers() {
+  document.querySelectorAll('[data-due]').forEach((el) => (el.textContent = Math.max(0, (Number(el.dataset.due) - Date.now()) / 1000).toFixed(0) + 's'));
+}
+setInterval(tickTimers, 500);
+
+$('#cancelBtn').onclick = () => confirm('Cancel this instance? Its tokens are removed; nothing is compensated.') && api(`/instances/${state.instanceId}/cancel`, { method: 'POST' });
+
+// ─────────────────────────── live updates ───────────────────────────
+let refreshTimer, listTimer;
+const events = new EventSource('/api/events');
+events.addEventListener('instance', (e) => {
+  const { instanceId } = JSON.parse(e.data);
+  if (instanceId === state.instanceId) { clearTimeout(refreshTimer); refreshTimer = setTimeout(refreshInstance, 60); }
+  clearTimeout(listTimer); listTimer = setTimeout(() => { loadInstances(); loadProcesses(); }, 300);
+});
+events.addEventListener('deployed', () => loadProcesses());
+
+// ─────────────────────────── boot ───────────────────────────
+(async () => {
+  state.handlers = await api('/handlers');
+  await loadProcesses();
+  await loadInstances();
+  if (state.selectedKey) await openInModeler(state.selectedKey);
+})();
+</script>
+</body>
+</html>
