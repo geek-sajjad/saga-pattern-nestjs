@@ -1,15 +1,9 @@
 import { BadRequestException, Body, Controller, Get, Header, MessageEvent, Param, Post, Put, Query, Sse } from '@nestjs/common';
 import { interval, map, merge, Observable } from 'rxjs';
-import { BpmnValidationError } from '../engine/bpmn-parser';
 import { BpmnEngine } from '../engine/bpmn-engine.service';
-import { ProcessInstance } from '../engine/entities';
+import { ProcessInstance, Wait } from '../engine/entities';
 import { HandlerRegistry } from '../engine/handlers';
-
-interface MigrateBody {
-  targetVersion?: number;
-  mapping?: Record<string, string>;
-  dryRun?: boolean;
-}
+import { BpmnValidationError } from '../engine/process-model';
 
 /** The engine's REST API. Camunda, Flowable and friends expose much the same set of calls. */
 @Controller('api')
@@ -58,13 +52,6 @@ export class BpmnController {
     return this.view(await this.engine.start(key, body?.variables ?? {}, pin));
   }
 
-  /** Move every running instance of one version to another: {fromVersion, targetVersion, mapping?, dryRun?}. */
-  @Post('processes/:key/migrate')
-  migrateAll(@Param('key') key: string, @Body() body: MigrateBody & { fromVersion?: number }) {
-    if (!body?.fromVersion || !body?.targetVersion) throw new BadRequestException('body must be {"fromVersion": 1, "targetVersion": 2, "mapping"?: {…}, "dryRun"?: true}');
-    return this.engine.migrateAll(key, Number(body.fromVersion), Number(body.targetVersion), body.mapping ?? {}, !!body.dryRun);
-  }
-
   @Get('handlers')
   handlerNames() {
     return this.handlers.names();
@@ -84,16 +71,23 @@ export class BpmnController {
   @Get('instances')
   async instances() {
     const all = await this.engine.listInstances();
-    return all.map((i) => ({
-      id: i.id,
-      definitionKey: i.definitionKey,
-      definitionVersion: i.definitionVersion,
-      status: i.status,
-      parentInstanceId: i.parentInstanceId,
-      incidents: i.tokens.filter((t) => t.state === 'INCIDENT').length,
-      waiting: [...new Set(i.tokens.filter((t) => t.state === 'WAITING' && !this.isContainer(t)).map((t) => t.nodeId))],
-      createdAt: i.createdAt,
-    }));
+    return Promise.all(
+      all.map(async (i) => {
+        const model = await this.engine.model(i.definitionKey, i.definitionVersion);
+        // Boundary events wait on behalf of their activity, which is already in the list.
+        const waitingAt = i.waits.filter((w) => w.kind !== 'executing' && w.kind !== 'join' && model.nodes[w.nodeId]?.type !== 'boundaryEvent');
+        return {
+          id: i.id,
+          definitionKey: i.definitionKey,
+          definitionVersion: i.definitionVersion,
+          status: i.status,
+          parentInstanceId: i.parentInstanceId,
+          incidents: i.incidents.length,
+          waiting: [...new Set(waitingAt.map((w) => w.nodeId))],
+          createdAt: i.createdAt,
+        };
+      }),
+    );
   }
 
   @Get('instances/:id')
@@ -120,13 +114,6 @@ export class BpmnController {
     return { ok: true };
   }
 
-  /** {targetVersion, mapping?: {"oldNodeId": "newNodeId"}, dryRun?: true} */
-  @Post('instances/:id/migrate')
-  migrate(@Param('id') id: string, @Body() body: MigrateBody) {
-    if (!body?.targetVersion) throw new BadRequestException('body must be {"targetVersion": 2, "mapping"?: {…}, "dryRun"?: true}');
-    return this.engine.migrate(id, Number(body.targetVersion), body.mapping ?? {}, !!body.dryRun);
-  }
-
   @Post('instances/:id/cancel')
   async cancel(@Param('id') id: string) {
     await this.engine.cancel(id);
@@ -140,26 +127,39 @@ export class BpmnController {
     return merge(this.engine.events.pipe(map((e) => ({ type: e.type, data: e }))), heartbeat);
   }
 
-  /** A token that only holds a scope open (sub-process, loop body, call activity): its work is shown elsewhere. */
-  private isContainer(t: ProcessInstance['tokens'][number]) {
-    return !!t.loop || !!t.childInstanceId;
-  }
-
-  /** The instance plus what the UI needs: open user tasks, timers and message subscriptions, called instances. */
+  /**
+   * The instance plus what the cockpit needs: where tokens are (to paint the
+   * diagram), open user tasks, timers and message subscriptions, called instances.
+   */
   private async view(instance: ProcessInstance) {
-    const def = await this.engine.definition(instance.definitionKey, instance.definitionVersion);
-    const label = (id: string) => def.nodes[id]?.name ?? id;
-    const userTasks = instance.tokens
-      .filter((t) => t.state === 'WAITING' && def.nodes[t.nodeId].type === 'userTask' && !t.loop)
-      .map((t) => {
-        const loop = def.nodes[t.nodeId].loop;
-        const item = loop && t.locals ? t.locals[loop.elementVariable] : undefined;
-        return { tokenId: t.id, nodeId: t.nodeId, name: label(t.nodeId), formFields: def.nodes[t.nodeId].formFields ?? [], iteration: loop ? { index: t.loopIndex, item } : undefined };
-      });
-    const subscriptions = instance.tokens.flatMap((t) =>
-      (t.subscriptions ?? []).map((s) => ({ ...s, tokenId: t.id, waitingAt: label(t.nodeId), eventName: label(s.eventId) })),
-    );
+    const model = await this.engine.model(instance.definitionKey, instance.definitionVersion);
+    const label = (id: string) => model.nodes[id]?.name ?? id;
+    const { engineState, waits, incidents, ...rest } = instance;
+
+    const tokens = [
+      // Timers and messages on boundary events are subscriptions of the activity they sit on, not tokens of their own.
+      ...waits
+        .filter((w) => model.nodes[w.nodeId]?.type !== 'boundaryEvent' && !incidents.some((i) => i.executionId === w.executionId))
+        .map((w) => ({ id: w.executionId, nodeId: w.nodeId, kind: w.kind, state: w.kind === 'executing' ? 'EXECUTING' : 'WAITING' })),
+      ...incidents.map((i) => ({ id: i.executionId, nodeId: i.nodeId, kind: 'incident', state: 'INCIDENT', incident: i.message })),
+    ];
+    const userTasks = waits
+      .filter((w) => w.kind === 'user')
+      .map((w) => ({ tokenId: w.executionId, nodeId: w.nodeId, name: label(w.nodeId), formFields: model.nodes[w.nodeId]?.formFields ?? [], iteration: w.iteration }));
+    const subscriptions = waits
+      .filter((w): w is Wait & { kind: 'message' | 'timer' } => w.kind === 'message' || w.kind === 'timer')
+      .map((w) => ({
+        kind: w.kind,
+        tokenId: w.executionId,
+        eventId: w.nodeId,
+        eventName: label(w.nodeId),
+        waitingAt: label(model.nodes[w.nodeId]?.attachedTo ?? w.nodeId),
+        messageName: w.messageName,
+        correlationKey: w.correlationKey,
+        dueAt: w.dueAt,
+        interrupting: w.interrupting,
+      }));
     const children = (await this.engine.children(instance.id)).map((c) => ({ id: c.id, definitionKey: c.definitionKey, definitionVersion: c.definitionVersion, status: c.status }));
-    return { ...instance, versionTag: def.versionTag ?? null, userTasks, subscriptions, children };
+    return { ...rest, versionTag: model.versionTag ?? null, tokens, userTasks, subscriptions, children };
   }
 }

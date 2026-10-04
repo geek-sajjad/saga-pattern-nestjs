@@ -178,19 +178,19 @@ apps/
     shipments/      HTTP controller, DTO validation, timeline view
   ocean-carrier/ customs/ trucking/ warehouse/ billing/
     src/            entity + service (business rules, do/undo) + TCP controller + main.ts
-  bpmn-engine/      mini BPMN tool: parser + token engine (src/engine), handlers, modeler/cockpit UI, .bpmn files
+  bpmn-engine/      mini BPMN tool: bpmn-engine wrapped with persistence (src/engine), handlers, modeler/cockpit UI, .bpmn files
 libs/common/src/    shared contracts: ports, message patterns, command types, failure simulation
 data/               one SQLite file per service (created on first start)
 ```
 
 ## 8. The same saga as a BPMN diagram
 
-[apps/bpmn-engine](apps/bpmn-engine/README.md) is a small BPMN tool written for learning: a modeler, an engine that runs
-BPMN 2.0 XML by passing tokens through the graph, and a cockpit. It drives this saga from a diagram
+[apps/bpmn-engine](apps/bpmn-engine/README.md) is a small BPMN tool written for learning: a modeler (bpmn-js), an engine
+that runs BPMN 2.0 XML (the open-source [bpmn-engine](https://github.com/paed01/bpmn-engine) library, plus persistence,
+versions, incidents and message correlation around it), and a cockpit. It drives this saga from a diagram
 ([shipment-saga.bpmn](apps/bpmn-engine/processes/shipment-saga.bpmn)), using compensation events and the same five participants.
 A bigger example, [import-shipment.bpmn](apps/bpmn-engine/processes/import-shipment.bpmn), adds escalation timers, messages,
-a sub-process, a separately versioned customs process (call activity) and one task per container, and the tool can
-migrate running instances between process versions.
+a sub-process, a separately versioned customs process (call activity) and one task per container.
 
 ```bash
 npm run start:participants

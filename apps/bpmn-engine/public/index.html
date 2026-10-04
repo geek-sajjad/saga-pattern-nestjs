@@ -82,8 +82,6 @@
   @media (max-width: 900px) { .mig-grid { grid-template-columns: minmax(0, 1fr); } }
   .diff { font-size: 12px; font-family: var(--mono); max-height: 200px; overflow: auto; }
   .diff .add { color: var(--ok); } .diff .del { color: var(--bad); } .diff .chg { color: var(--warn); }
-  #migMapping { width: 100%; min-height: 54px; }
-  .ok-text { color: var(--ok); font-size: 12px; white-space: pre-wrap; }
   .pill.incident { color: var(--bad); background: var(--bad-bg); border-color: transparent; }
 
   .presets { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
@@ -125,7 +123,7 @@
   .h.incident .k, .h.error-caught .k { color: var(--bad); }
   .h.compensated .k, .h.compensation-started .k { color: var(--warn); }
   .h.instance-completed .k { color: var(--ok); }
-  .h.message-received .k, .h.timer-fired .k, .h.called .k, .h.loop-started .k, .h.migrated .k { color: var(--accent); }
+  .h.message-received .k, .h.timer-fired .k, .h.called .k, .h.task-completed .k { color: var(--accent); }
   .h.error-propagated .k { color: var(--bad); }
   .h.variables-changed .k { color: var(--accent); }
   .empty { color: var(--faint); font-size: 13px; padding: 8px 0; }
@@ -150,7 +148,7 @@
 <body>
 <header>
   <h1>Mini BPMN</h1>
-  <span class="sub">a teaching BPMN tool: <b>modeler</b> (draw &amp; deploy) → <b>engine</b> (runs tokens through the graph) → <b>cockpit</b> (watch &amp; operate instances)</span>
+  <span class="sub">a teaching BPMN tool: <b>modeler</b> (bpmn-js: draw &amp; deploy) → <b>engine</b> (bpmn-engine: runs tokens through the graph) → <b>cockpit</b> (watch &amp; operate instances)</span>
 </header>
 
 <div class="layout">
@@ -242,7 +240,7 @@
         </div>
       </section>
       <section class="panel" style="grid-column: 1 / -1" id="versionsPanel">
-        <h2>Versions &amp; migration</h2>
+        <h2>Versions</h2>
         <div class="pad" id="versions"></div>
       </section>
       <section class="panel" style="grid-column: 1 / -1">
@@ -273,6 +271,7 @@ const api = async (path, opts = {}) => {
  * BPMN is extensible: vendors add their own attributes in their own XML namespace
  * (Camunda uses zeebe:taskDefinition, Flowable uses flowable:class…). Teaching the
  * modeler about ours makes mini:handler / mini:formFields survive editing and export.
+ * The engine registers the same schema (src/engine/mini-moddle.ts); keep the two in sync.
  */
 const MINI_MODDLE = {
   name: 'Mini', uri: 'https://example.com/mini-bpmn', prefix: 'mini', xml: { tagAlias: 'lowerCase' }, associations: [],
@@ -365,7 +364,7 @@ async function loadProcesses() {
   const latest = new Map();
   for (const d of all) if (!latest.has(d.key)) latest.set(d.key, { ...d, versions: all.filter((x) => x.key === d.key) });
   state.processes = [...latest.values()];
-  // Every version stays deployed: instances started on it keep running on it until they end or are migrated.
+  // Every version stays deployed: instances started on it keep running on it until they end.
   const chip = (v) => `<span class="pill tag" title="${v.running} running instance(s)">v${v.version}${v.versionTag ? ' · ' + esc(v.versionTag) : ''}${v.running ? ` · ${v.running}▶` : ''}</span>`;
   $('#processes').innerHTML = state.processes.map((p) => `
     <div class="item ${p.key === state.selectedKey ? 'sel' : ''}">
@@ -719,73 +718,42 @@ function renderInstancePanels(inst) {
   renderVersions(inst);
 }
 
-// ─────────────────────────── versions & migration ───────────────────────────
-/** Mappings a migration between two versions needs, when a node was replaced (shipped with the sample files). */
-const SUGGESTED_MAPPINGS = { 'customs-clearance@1>2': { Wait_Release: 'Gw_Decision' } };
-
+// ─────────────────────────── versions ───────────────────────────
 let versionsFor = '';
 async function renderVersions(inst) {
   const versions = state.processes.find((p) => p.key === inst.definitionKey)?.versions ?? [];
   const others = versions.filter((v) => v.version !== inst.definitionVersion);
-  // Rebuild only when the instance, its version or its status changes: keeps the mapping you typed.
-  const signature = `${inst.id}@${inst.definitionVersion}@${inst.status}@${versions.map((v) => v.version).join()}`;
+  // Rebuild only when the instance or the set of versions changes: keeps the version you picked.
+  const signature = `${inst.id}@${inst.definitionVersion}@${versions.map((v) => v.version).join()}`;
   if (signature === versionsFor) return;
   versionsFor = signature;
   const current = versions.find((v) => v.version === inst.definitionVersion);
   const tag = (v) => `v${v.version}${v.versionTag ? ' (' + esc(v.versionTag) + ')' : ''}`;
-  if (!others.length || inst.status !== 'RUNNING') {
-    $('#versions').innerHTML = `<div class="empty">Runs on ${current ? tag(current) : 'v' + inst.definitionVersion}. ${inst.status !== 'RUNNING' ? 'Only running instances can be migrated.' : 'This process has a single version; deploy a change from the modeler to get v2.'}</div>`;
+  const runsOn = `Runs on <b>${current ? tag(current) : 'v' + inst.definitionVersion}</b> until it ends, even when newer versions are deployed.`;
+  if (!others.length) {
+    $('#versions').innerHTML = `<div class="empty">${runsOn} This process has a single version; deploy a change from the modeler to get v2.</div>`;
     return;
   }
-  const target = others[0];
   $('#versions').innerHTML = `
     <div class="mig-grid">
       <div>
-        <div class="row"><span>Runs on <b>${current ? tag(current) : 'v' + inst.definitionVersion}</b>. Move it to</span>
-          <select id="migTarget">${others.map((v) => `<option value="${v.version}">${tag(v)}</option>`).join('')}</select></div>
-        <div class="muted" style="font-size:12px;margin:8px 0 4px">Mapping for nodes that don't exist in the target (old id → new id, JSON):</div>
-        <textarea id="migMapping" spellcheck="false"></textarea>
-        <div class="row" style="margin-top:6px">
-          <button class="btn small ghost" id="migDry">Dry run</button>
-          <button class="btn small" id="migGo">Migrate this instance</button>
-          <button class="btn small ghost" id="migAll" title="every RUNNING instance of v${inst.definitionVersion}">Migrate all running v${inst.definitionVersion}</button>
-        </div>
-        <div id="migResult" style="margin-top:6px"></div>
+        <div>${runsOn}</div>
+        <div class="row" style="margin-top:8px"><span>Compare with</span>
+          <select id="diffTarget">${others.map((v) => `<option value="${v.version}">${tag(v)}</option>`).join('')}</select></div>
       </div>
-      <div><div class="muted" style="font-size:12px;margin-bottom:4px">What changed between the versions:</div><div class="diff" id="migDiff">…</div></div>
+      <div><div class="muted" style="font-size:12px;margin-bottom:4px">What changed between the versions:</div><div class="diff" id="versionDiff">…</div></div>
     </div>`;
-  const targetVersion = () => Number($('#migTarget').value);
   const loadDiff = async () => {
-    const v = targetVersion();
-    $('#migMapping').value = JSON.stringify(SUGGESTED_MAPPINGS[`${inst.definitionKey}@${inst.definitionVersion}>${v}`] ?? {}, null, 1);
-    const d = await api(`/processes/${encodeURIComponent(inst.definitionKey)}/diff?from=${inst.definitionVersion}&to=${v}`);
+    const d = await api(`/processes/${encodeURIComponent(inst.definitionKey)}/diff?from=${inst.definitionVersion}&to=${$('#diffTarget').value}`);
     const line = (cls, sign, n) => `<div class="${cls}">${sign} ${esc(n.id)} <span class="muted">${esc(n.type)}${n.name ? ' "' + esc(n.name) + '"' : ''}</span></div>`;
-    $('#migDiff').innerHTML = [
+    $('#versionDiff').innerHTML = [
       ...d.added.map((n) => line('add', '+', n)),
       ...d.removed.map((n) => line('del', '−', n)),
       ...d.changed.map((c) => line('chg', '~', c.to)),
     ].join('') || '<div class="muted">no node changes (only layout, conditions or flows)</div>';
   };
-  const run = async (path, extra) => {
-    $('#migResult').innerHTML = '';
-    try {
-      const mapping = JSON.parse($('#migMapping').value || '{}');
-      const r = await api(path, { method: 'POST', body: JSON.stringify({ targetVersion: targetVersion(), mapping, ...extra }) });
-      const results = r.results ?? [r];
-      const failed = results.filter((x) => !x.ok);
-      const verb = extra.dryRun ? 'would migrate' : 'migrated';
-      $('#migResult').innerHTML = `<div class="ok-text">${verb} ${results.length - failed.length} of ${results.length} instance(s)</div>` +
-        failed.map((x) => `<div class="err">${x.instanceId.slice(0, 8)}:\n • ${x.problems.map(esc).join('\n • ')}</div>`).join('');
-    } catch (e) {
-      $('#migResult').innerHTML = `<div class="err">${esc(e.message)}</div>`;
-    }
-  };
-  $('#migTarget').onchange = loadDiff;
-  $('#migDry').onclick = () => run(`/instances/${inst.id}/migrate`, { dryRun: true });
-  $('#migGo').onclick = () => run(`/instances/${inst.id}/migrate`, {});
-  $('#migAll').onclick = () => confirm(`Migrate every running v${inst.definitionVersion} instance of ${inst.definitionKey}?`) &&
-    run(`/processes/${encodeURIComponent(inst.definitionKey)}/migrate`, { fromVersion: inst.definitionVersion });
-  loadDiff().catch((e) => ($('#migDiff').textContent = e.message));
+  $('#diffTarget').onchange = () => loadDiff().catch((e) => ($('#versionDiff').textContent = e.message));
+  loadDiff().catch((e) => ($('#versionDiff').textContent = e.message));
 }
 
 // Operators may fix data before retrying an incident (Camunda Operate can do the same).

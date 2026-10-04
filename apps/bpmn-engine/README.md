@@ -1,7 +1,12 @@
-# Mini BPMN: build-your-own BPMN tool
+# Mini BPMN: a BPMN tool built on bpmn-engine
 
 A small BPMN tool built for learning. It runs the same freight-forwarding saga as `apps/orchestrator`, except this time
 the flow is a **diagram** and a generic **engine** runs it. The orchestrator hand-codes that flow in TypeScript.
+
+The engine is [bpmn-engine](https://github.com/paed01/bpmn-engine) (MIT), an open-source BPMN 2.0 execution engine for
+Node.js. This app adds what every product built on a BPMN library has to add itself: deployments and versions,
+persistence across restarts, service tasks wired to code, incidents, message correlation, call activities across
+process versions, and saga-style compensation.
 
 ```
 npm run start:participants      # the 5 services the saga talks to (terminal 1)
@@ -10,6 +15,9 @@ open http://localhost:3200/
 ```
 
 Port: `BPMN_PORT` (default 3200). State: `data/bpmn-engine.sqlite` (`npm run db:reset` wipes it).
+
+> Coming from the hand-written engine (commit `d2d16b0`)? Its saved instances use a different format.
+> Run `npm run db:reset` once before starting.
 
 ---
 
@@ -28,15 +36,20 @@ A "BPMN tool" (Camunda, Flowable, jBPM, Activiti, Bonita…) always has the same
 | Part | Job | Here | Real-world example |
 |---|---|---|---|
 | **Modeler** | Draw the diagram, save it as `.bpmn` XML | *Modeler* tab ([public/index.html](public/index.html), uses `bpmn-js`) | Camunda Modeler, bpmn.io |
-| **Engine** | Parse the XML, run *instances* of it, persist their state, call your code | [src/engine/](src/engine/) | Camunda 7/8 (Zeebe), Flowable |
+| **Engine** | Parse the XML, run *instances* of it, persist their state, call your code | `bpmn-engine` + [src/engine/](src/engine/) | Camunda 7/8 (Zeebe), Flowable |
 | **Cockpit** | See running instances, complete human tasks, fix failures | *Cockpit* tab | Camunda Operate / Tasklist / Cockpit |
 
 ```
   Modeler ──(deploy XML)──▶ Engine ──(calls)──▶ your code (handlers) ──▶ ocean-carrier, customs, …
-     ▲                      │  ▲                                        (the existing TCP services)
-     │                      ▼  │ complete task / retry
+  bpmn-js                   bpmn-engine                                 (the existing TCP services)
+     ▲                      + src/engine
+     │                      │  ▲
+     │                      ▼  │ complete task / retry / send message
   .bpmn file           SQLite  Cockpit
 ```
+
+Both libraries come from the same family: bpmn-js draws with **bpmn-moddle**, and bpmn-engine parses with bpmn-moddle
+too. The modeler and the engine can never disagree about what a file means.
 
 ## 2. Anatomy of a `.bpmn` file
 
@@ -63,12 +76,15 @@ Open [processes/quote-approval.bpmn](processes/quote-approval.bpmn). It has two 
 - **② The diagram (DI)** is only coordinates, for the modeler and viewer. The engine ignores it.
 - **Extension attributes** (`mini:handler`, `mini:formFields`) are how *every* vendor connects the standard to real code,
   each in its own namespace: Camunda 8 uses `zeebe:taskDefinition type="…"`, Flowable uses `flowable:class="…"`.
+  The `mini:` schema is registered with bpmn-moddle ([src/engine/mini-moddle.ts](src/engine/mini-moddle.ts)), so
+  `mini:handler="ocean.book"` arrives in the engine as a plain `handler` property of the service task.
 
-## 3. How the engine works: token passing
+## 3. How the engine works
 
-The whole engine rests on one idea, which you can watch in the cockpit: **a process instance holds tokens, and each token sits on a node.**
-The engine keeps picking a `READY` token and runs that node's behaviour
-([bpmn-engine.service.ts](src/engine/bpmn-engine.service.ts), method `execute`):
+### Token passing (what bpmn-engine does)
+
+The whole engine rests on one idea, which you can watch in the cockpit: **a process instance holds tokens, and each token
+sits on a node.** bpmn-engine moves the tokens and runs each node's behaviour:
 
 | Element | Symbol | Behaviour |
 |---|---|---|
@@ -79,47 +95,76 @@ The engine keeps picking a `READY` token and runs that node's behaviour
 | Timer / message catch event | ◎🕒 ◎✉ | **Wait state.** Park the token until the duration (`PT15S`) passes or the message arrives |
 | Exclusive gateway (XOR) | ◇ | Take the **first** outgoing flow whose condition is true, else the `default` flow |
 | Parallel gateway (AND) | ◇+ | **Fork:** one token per outgoing flow. **Join:** wait until a token arrived on *every* incoming flow, then merge them |
-| Event-based gateway | ◇⬠ | **Race.** Subscribe to every event after it (messages, timers); the first one to happen wins, the others are dropped |
-| Sub-process | ▭ around a graph | Park the token on the sub-process and start a child token at its start event. When the last token inside ends, continue |
+| Event-based gateway | ◇⬠ | **Race.** Wait for every event after it (messages, timers); the first one to happen wins, the others are dropped |
+| Sub-process | ▭ around a graph | Run the graph inside it; when the last token inside ends, continue |
 | Call activity | ▢ thick border | Start a **separate instance** of another process (the version picked by its binding) and wait until it ends |
 | Multi-instance activity | ▢ ⦀ or ☰ | Run the activity once per item of a list, in parallel (⦀) or one after another (☰); collect the results |
 | Error boundary event | ⚡ on an activity | If the activity (or anything inside it) throws that BPMN error, abandon it and continue from here |
 | Timer / message boundary event | 🕒 ✉ on an activity | While the activity waits: **interrupting** (solid) cancels it and continues here; **non-interrupting** (dashed) starts an extra token here and keeps the activity waiting |
 | Compensation throw event | ⏪ | Run the compensation handlers of the **completed** activities in **reverse order** |
-| End event | ● | Consume the token. No tokens left = scope done (sub-process continues, or the instance is `COMPLETED`) |
-| Terminate end event | ◉ | Remove every other token **of its scope** (the whole instance, or just the sub-process) |
+| End event | ● | Consume the token. No tokens left = the instance is `COMPLETED` |
+| Terminate end event | ◉ | Remove every other token of its scope |
 | Error end event | ⓧ | Throw a BPMN error. It travels outwards: enclosing sub-processes, then the calling process |
 
-In pseudo-code, the engine is:
+bpmn-engine runs all of this **in memory**, as a message broker inside your process: every element publishes events
+(`activity.wait`, `activity.end`, `flow.take`, …) and reacts to messages (`signal`, `discard`, …).
+
+### The platform around it (what src/engine adds)
+
+An in-memory engine is not yet a BPMN *tool*. [bpmn-engine.service.ts](src/engine/bpmn-engine.service.ts) wraps it:
 
 ```ts
-while (instance has a READY token) {
-  execute(token.node)   // may move the token, fork it, park it (WAITING) or fail it (INCIDENT)
-  save(instance)        // after EVERY step: a crash loses nothing
-}
-// stop: every remaining token waits for a person, a timer, a join, or an operator
+// one bpmn-engine Engine per running instance
+const engine = new Engine({
+  source: xml,                                   // the deployed version this instance runs on
+  moddleOptions: { mini: MINI_MODDLE },          // so mini:handler & co. survive parsing
+  expressions: libraryExpressions(…),            // ${…} is JavaScript over our process variables
+  extensions: { mini: (activity) => … },         // every service task calls its mini:handler
+  elements: { CompensateEventDefinition: … },    // our compensation (see below)
+});
+await engine.execute({ listener });              // every event → history, waits, then save
+// …after every burst of events:
+row.engineState = await engine.getState();       // bpmn-engine's snapshot: tokens, timers, loop counters
+// …on boot, for every RUNNING row:
+new Engine(options).recover(row.engineState).resume({ listener });
 ```
-
-### Concepts worth knowing (each one is in the code)
 
 | Concept | What it means | Where |
 |---|---|---|
 | **Definition vs instance** | The deployed diagram is a *class*, each run of it is an *object* with its own tokens and variables | [entities.ts](src/engine/entities.ts) `Deployment`, `ProcessInstance` |
-| **Versioning** | Deploying the same process key again creates **v2**. Running instances stay on the version they started with, and the cockpit draws that exact version. See [section 5](#5-versioning-and-migration) | `deploy()`, `definition(key, version)` |
-| **Scopes (token tree)** | A token entering a sub-process stays on it (so its boundary events can fire) and a child token runs inside. Every token knows its `scopeId`; an interrupting event removes everything below it | `Token.scopeId`, `descendants()`, `interrupt()` |
-| **Error propagation** | A BPMN error looks for a catcher outwards: the task's boundary, the enclosing sub-process, its parent… then the calling process. Nothing catches it? Incident (or, in a called instance, the instance ends as `TERMINATED` and hands the error to its caller) | `throwError()` |
-| **Messages & correlation** | A waiting token *subscribes* to a message name plus a correlation key evaluated at that moment (`${shipmentRef}` → `IMP-1A2B3C`). `POST /api/messages` delivers to every instance with a matching subscription. No buffering: a message nobody waits for is dropped | `subscribe()`, `correlateMessage()` |
-| **Subscriptions** | Everything a waiting token listens for (own timer/message, the events after an event-based gateway, timer/message boundaries) is one list on the token. The first one to fire decides | `Token.subscriptions`, `fire()` |
-| **Call activity** | The child is a separate instance with its own variables, history and version. `mini:inputs` / `mini:outputs` choose what crosses the border. Parent and child talk through "after save" hooks, and a restart repairs links a crash broke | `startCallActivity()`, `onChildEnded()`, `resumeAfterRestart()` |
-| **Multi-instance** | The arriving token becomes the loop *body*; one child token per item carries the item as a **local** variable. Results land in the iteration, not the process, so parallel iterations don't overwrite each other | `startLoop()`, `writeVariables()` |
-| **Parsing & validation** | Deployment rejects diagrams the engine can't run (dead ends, unreachable nodes, XOR flows without conditions, unsupported elements) | [bpmn-parser.ts](src/engine/bpmn-parser.ts) `validate()` |
-| **Process variables** | The data travelling with the instance. Handlers read them and return changes; conditions are evaluated against them | `variables`, [expressions.ts](src/engine/expressions.ts) |
-| **Wait states & persistence** | User tasks and timers can last days. The instance lives in SQLite, not in memory. Restart the engine while a timer runs and it still fires | `fireDueTimers()`, `resumeAfterRestart()` |
-| **Business error vs technical error** | `throw new BpmnError(code)` is an outcome the *diagram* handles (error boundary event). Any other exception is an **incident**: the token stops and an operator must retry | [handlers.ts](src/engine/handlers.ts), `executeServiceTask()` |
-| **Incidents & retry** | "trucking is down" isn't a business outcome, so it isn't drawn. The token waits in `INCIDENT` until someone fixes the cause and clicks *Retry* (optionally after editing variables) | `retryIncident()`, `setVariables()` |
-| **At-least-once execution** | The token is saved as `EXECUTING` before a handler runs. After a crash the handler runs **again**, so handlers must be idempotent (the participants key everything by `sagaId` = instance id) | `executeServiceTask()`, `resumeAfterRestart()` |
+| **Versioning** | Deploying the same process key again creates **v2**. Running instances stay on the version they started with, and the cockpit draws that exact version. See [section 5](#5-versioning) | `deploy()`, `model(key, version)` |
+| **Persistence & restarts** | After each burst of events the instance row gets bpmn-engine's `getState()` snapshot. On boot every `RUNNING` row is restored with `recover()` + `resume()`. Timers keep their original due time | `persist()`, `resume()` |
+| **Events → our bookkeeping** | bpmn-engine reports through a listener. We turn its events into the audit trail and into `waits`: what the instance is busy with (user tasks, messages, timers, joins, calls), so the cockpit and the REST API don't have to understand the snapshot | `onEngineEvent()`, `Wait` |
+| **Process variables** | The data travelling with the instance. They live in **our** row, not in bpmn-engine's scoped environments: handlers read them and return changes, and the expression resolver evaluates conditions against them | `variables`, [expressions.ts](src/engine/expressions.ts) |
+| **Handlers (glue code)** | An *extension* gives every service task a `Service` that calls the `mini:handler` from the registry. The diagram says *what* happens and in which order; handlers say *how* | `handlerService()`, [freight-handlers.ts](src/handlers/freight-handlers.ts) |
+| **Business error vs technical error** | `throw new BpmnError(code)` is an outcome the *diagram* handles: bpmn-engine routes it to the error boundary event with that `errorCode`. Any other exception is an **incident** | [handlers.ts](src/engine/handlers.ts), `runHandler()` |
+| **Incidents & retry** | "trucking is down" isn't a business outcome, so it isn't drawn. We simply don't complete the service task: it stays parked (across restarts too) until someone fixes the cause and clicks *Retry*, optionally after editing variables | `incident()`, `retryIncident()` |
+| **At-least-once execution** | If the engine stops while a handler runs, bpmn-engine executes the task again after `resume()`, so handlers must be idempotent (the participants key everything by `sagaId` = instance id) | `runHandler()` |
+| **Messages & correlation** | A waiting message event *subscribes* with a correlation key evaluated at that moment (`${shipmentRef}` → `IMP-1A2B3C`). `POST /api/messages` finds the instance with a matching wait and signals bpmn-engine with the `<bpmn:message>` id. No buffering: a message nobody waits for is dropped | `subscribe()`, `correlateMessage()` |
+| **Call activity** | bpmn-engine can only call processes from the same file, so it emits `activity.call` and waits. We start a **separate instance** of the called process (version chosen by `mini:calledElementBinding`), then signal the call activity when the child completes, or send it the child's uncaught error | `onCallActivity()`, `onChildEnded()` |
+| **Multi-instance** | bpmn-engine runs one iteration per item of `mini:collection`. Each iteration sees its item (`mini:elementVariable`) and `loopCounter`; its result goes into the loop's output (`mini:outputCollection`), not into the process variables, so parallel iterations don't overwrite each other | `localsOf()`, `activity.end` |
 | **Compensation (BPMN's built-in saga)** | Each forward task has a compensation boundary event ⏪ linked (dotted *association*) to its undo task. The throw event undoes completed tasks in reverse; already-undone ones are skipped on retry | `compensate()` |
-| **Handlers (glue code)** | The diagram says *what* happens and in which order; handlers say *how*. They are tiny | [freight-handlers.ts](src/handlers/freight-handlers.ts) |
+| **Parsing & validation** | Deployment rejects diagrams this app can't run (service tasks without a handler, XOR flows without conditions, script tasks, …) before bpmn-engine ever sees them | [process-model.ts](src/engine/process-model.ts) |
+
+### Where we changed bpmn-engine's behaviour (and why)
+
+Using a library means accepting its semantics, or replacing a piece deliberately. Four places where this app does:
+
+1. **Compensation.** bpmn-elements' compensation only reaches activities in the scope that throws it, and starts all undo
+   tasks at once. The import process throws compensation *outside* the sub-process that booked things, and a saga
+   should undo newest first, one step at a time, with an incident if an undo fails. So the app swaps in its own
+   `CompensateEventDefinition` (`compensationBehaviour()`): the throw event runs the undo handlers from our list of
+   completed activities, and only then lets the token continue.
+2. **Real parallelism.** bpmn-engine really runs both branches of a parallel gateway at the same time. When the
+   warehouse rejects while the ocean booking is still in flight, the sub-process is interrupted, **but the ocean
+   carrier still books the vessel**. A handler that finishes after its task was interrupted is therefore still recorded
+   as completed, and compensation waits for in-flight handlers before deciding what to undo. Try *No warehouse* in the
+   import process and look for "finished after the task was interrupted" in the history.
+3. **Uncaught error end events.** bpmn-engine simply ends the process. Here the instance ends as `TERMINATED`, and a
+   called instance hands its error to the calling process's call activity (`CARGO_SEIZED`).
+4. **Expressions.** bpmn-engine's default expressions only resolve paths (`${environment.variables.quote.amount}`),
+   without operators. The app plugs in a resolver where `${quote.amount > 10000}` is JavaScript over the process
+   variables, so the diagrams keep the short form.
 
 ## 4. Things to try
 
@@ -132,6 +177,7 @@ while (instance has a READY token) {
 | Timeout → incident | Trucking commits but replies too late, so you get a red incident (*outcome unknown*). Click **Edit** on the variables, delete `"simulate"`, save, then **Retry**. Trucking returns the booking it already made (idempotency) and the saga finishes |
 | Flaky compensation → incident | Customs' undo fails twice: two incidents on the compensation event. Retry twice: warehouse and trucking are **not** undone again |
 | *Stop a participant* (Ctrl+C), start a saga | Incident "not running (ECONNREFUSED)". Start it again, Retry |
+| *Stop the BPMN tool* while an instance waits for a timer or has an incident, start it again | The instance continues: the timer fires at its original time, the incident is still there |
 
 **Quote approval** ([processes/quote-approval.bpmn](processes/quote-approval.bpmn)):
 
@@ -142,7 +188,7 @@ while (instance has a READY token) {
 
 1. *Open in modeler* → shipment saga. Drag "Book trucks" after "Reserve warehouse space" (reconnect the arrows).
 2. **Deploy**. You get **v2**. Old instances still show v1 in the cockpit; new ones run the new order.
-3. Try deploying something broken (a task with no outgoing flow) and read the engine's validation errors.
+3. Try deploying something broken (a service task without `mini:handler`) and read the engine's validation errors.
 4. Add a user task "Ops double-checks the booking" before billing and set *mini:formFields* to `ok:boolean` in the side panel.
 
 ### Door-to-door import: everything at once
@@ -172,12 +218,13 @@ does what the carrier's or the customs system's webhook would do: `POST /api/mes
 | Low risk, 3 containers | Bookings run in the sub-process: ocean and warehouse in parallel, then trucks. The call activity starts **customs-clearance v2** as a separate instance (click the link above the diagram). Its event-based gateway waits for three things at once. Send `CustomsCleared` there; back in the parent, send `AddressChanged` (the wait continues) and then `VesselArrived`. Slots are planned **one container after another**, then you get **one delivery task per container**. Tick *damaged* on one of them to see the claim branch |
 | High value → compliance review | Wait 20s: a reminder runs **beside** the open review (non-interrupting). Wait 45s: the review is **cancelled** and the head of compliance gets the task (interrupting). Untick `cleared` to end via the terminate event |
 | Embargoed origin | The XOR's third branch: refused before anything is booked |
-| No warehouse | The warehouse rejects the booking **inside** the sub-process. The error boundary on the sub-process (not on the task) catches it and ends the parallel ocean branch. Compensation undoes **only** the ocean booking: trucks were never booked |
+| No warehouse | The warehouse rejects the booking **inside** the sub-process. The error boundary on the sub-process (not on the task) catches it and interrupts the parallel ocean booking, which still completes at the carrier. Compensation undoes **only** the ocean booking: trucks were never booked |
 | Wait inside customs (any preset that reaches customs) | Do nothing for 30s: the child chases the broker and goes back to waiting (a loop through an XOR merge). At 40s the parent tells the customer that customs is slow, without interrupting the call |
 | Cargo seized (low-risk preset) | In the child, send `InspectionOrdered`, then complete *Inspect the cargo* with `passed` unticked. The child throws `CARGO_SEIZED` from an error end event. Nothing in the child catches it, so the child ends `TERMINATED` and the error lands on the parent's call activity: trucks, warehouse and ocean are undone, newest first |
+| Pin customs release 2026.1 (v1) | The call activity binds by version tag, so this order runs the **older** customs process (a receive task instead of the event-based gateway), while new orders get 2026.2 |
 | Credit limit | Billing is last on purpose: by then the goods are delivered and there is nothing left to compensate. The rejected charge goes to a person instead (*Collect payment manually*) |
 
-## 5. Versioning and migration
+## 5. Versioning
 
 Process definitions change while instances are running. A clearance started last week must not jump into a diagram it
 was never designed for. Real engines solve this the same way this one does:
@@ -185,35 +232,21 @@ was never designed for. Real engines solve this the same way this one does:
 | Concept | What it means here | Real-world equivalent |
 |---|---|---|
 | **Immutable versions** | Every deploy of a key with different XML creates the next version. XML that is already deployed (as *any* version) creates nothing new, so restarting doesn't add versions | Camunda 7 deployments, Zeebe process versions |
-| **Instances stay put** | An instance runs on the version it started with until it ends or someone migrates it. The process list shows how many instances still run on each version (`v1 · 2026.1 · 2▶`) | same |
+| **Instances stay put** | An instance runs on the version it started with until it ends. The process list shows how many instances still run on each version (`v1 · 2026.1 · 2▶`) | same |
 | **Version tag** | `mini:versionTag="2026.2"` on `<bpmn:process>`: a label people choose. Numbers are assigned by the engine and differ between environments; tags don't | `camunda:versionTag`, Zeebe `versionTag` |
 | **Start a specific version** | `POST /api/processes/:key/start {variables, version}` or `{versionTag}`; the *Start* panel has a version picker | `startProcessInstanceById` |
 | **Call activity binding** | `mini:calledElementBinding` = `latest` (newest at call time), `version` (exact number) or `versionTag`. The value may be an expression: import-shipment calls `${customsRelease}`, so one order can pin release 2026.1 while new orders get 2026.2 | `camunda:calledElementBinding`, Zeebe `bindingType` |
-| **Diff** | `GET /api/processes/:key/diff?from=1&to=2`: nodes added, removed or changed between two versions | Camunda Modeler's diff |
-| **Migration** | `POST /api/instances/:id/migrate {targetVersion, mapping, dryRun}` moves a running instance. Every token goes to the node with the same id in the target, or to `mapping[oldId]`. Nothing changes unless **all** tokens fit | Camunda 7 migration API, Camunda 8 Operate |
-| **Batch migration** | `POST /api/processes/:key/migrate {fromVersion, targetVersion, mapping}` migrates every running instance of a version; each one succeeds or fails on its own | Camunda batch migration |
+| **Diff** | `GET /api/processes/:key/diff?from=1&to=2`: nodes added, removed or changed between two versions. The cockpit's *Versions* panel shows it | Camunda Modeler's diff |
 
-Migration refuses what it can't do safely: a node that doesn't exist in the target, a user task mapped to a different
-kind of activity, a node in another sub-process, a join whose incoming flow disappeared, a handler that is running right
-now. Waiting events, receive tasks and event-based gateways **may** change type, because their subscriptions can be
-rebuilt from the new diagram. A timer that exists in both versions keeps its due time.
+customs-clearance ships in two releases: [v1 (2026.1)](processes/customs-clearance.v1.bpmn) waits for release in a
+**receive task**; [v2 (2026.2)](processes/customs-clearance.v2.bpmn) replaces it with an **event-based gateway** that can
+also handle an inspection. Start an import with *Pin customs release 2026.1* and compare the two versions in the child's
+*Versions* panel.
 
-**Try it**: customs-clearance ships in two releases.
-[v1 (2026.1)](processes/customs-clearance.v1.bpmn) waits for release in a **receive task**.
-[v2 (2026.2)](processes/customs-clearance.v2.bpmn) replaces it with an **event-based gateway** that can also handle an inspection.
-
-1. Start *Door-to-door import* with the preset **Pin customs release 2026.1**. The call activity starts customs **v1**.
-   Open the child (link above the diagram).
-2. *Versions & migration* shows the diff: `− Wait_Release`, `+ Gw_Decision`, … Click **Dry run** with an empty mapping `{}`:
-   *v2 has no node "Wait_Release"*. The suggested mapping `{"Wait_Release": "Gw_Decision"}` is pre-filled. Dry run → OK.
-3. **Migrate this instance**. The cockpit now draws v2. The token waits at the gateway with three new subscriptions,
-   so the migrated instance can take the inspection path, which didn't exist when it started. The parent is unaffected.
-4. Start a few customs-clearance v1 instances directly (version picker → v1) and use **Migrate all running v1**.
-
-```bash
-curl -X POST localhost:3200/api/instances/<id>/migrate -H 'content-type: application/json' \
-     -d '{"targetVersion": 2, "mapping": {"Wait_Release": "Gw_Decision"}, "dryRun": true}'
-```
+**What about migrating running instances?** Camunda can move a running instance to a newer version (map old node ids
+to new ones). bpmn-engine has no such feature: its snapshot is an internal format, and rewriting it would break with
+every library upgrade. So instances here finish on the version they started with, which is also the safe default in
+real engines. See exercise 4 below.
 
 ## 6. Diagram vs code: compared with `apps/orchestrator`
 
@@ -230,31 +263,31 @@ Neither one is "better". BPMN pays off when processes are long-running, involve 
 The import process shows where that line is: escalation timers, waiting for a vessel for weeks, a separately versioned
 customs process and one task per container would each be a project of their own in the hand-coded orchestrator.
 
-## 7. What real engines add (good exercises)
+## 7. What real platforms add (good exercises)
 
-The engine is about 1,700 lines including comments, and it deliberately leaves things out. In rough order of difficulty:
+bpmn-engine does the BPMN semantics; the platform around it is about 1,300 lines including comments. In rough order of difficulty:
 
 1. **Message buffering**: Zeebe keeps a published message for its TTL, so it still correlates if the process gets to the receive task a moment later. Here a message nobody waits for is lost. Add a `messages` table with an expiry.
-2. **Timer cycles** (`R3/PT10S`): a non-interrupting boundary that fires every 10s instead of once.
-3. **Event sub-process**: a sub-process with `triggeredByEvent="true"` that starts when a message arrives anywhere in its scope ("customer cancels the order").
-4. **Inclusive gateway (OR)**: forking is easy; the join is the classic hard problem (how does it know which branches will never arrive?).
-5. **Migrating call-activity children** together with their parent, and migration plans that also rename variables.
-6. **External task workers** (the Camunda 8/Zeebe model): instead of calling handlers in-process, the engine publishes jobs and workers poll `GET /jobs?type=ocean.book`, then `POST /jobs/:id/complete`.
-7. **Optimistic locking**: add a `version` column and reject concurrent saves instead of the in-memory lock, so you can run two engine nodes.
-8. **A durable outbox**: parent/child notifications live in memory until the next save (`afterSave`), and `resumeAfterRestart()` repairs what a crash loses. Store them in a table instead.
-9. **History tables**: move `history` into its own table and build reporting (average time per task, where instances get stuck).
-10. **A safe expression language**: replace the `new Function` in [expressions.ts](src/engine/expressions.ts) with FEEL or a small parser. Today, anyone who can deploy can run code on the server.
+2. **History tables**: move `history` into its own table and build reporting (average time per task, where instances get stuck).
+3. **A safe expression language**: replace the `new Function` in [expressions.ts](src/engine/expressions.ts) with FEEL or a small parser. Today, anyone who can deploy can run code on the server.
+4. **Instance migration**: move a waiting instance to a newer version, for the easy case (every token waits at a node that exists in both versions): start the new version's engine, `recover()` the old snapshot into it, and check what breaks.
+5. **External task workers** (the Camunda 8/Zeebe model): instead of calling handlers in-process, publish jobs; workers poll `GET /jobs?type=ocean.book`, then `POST /jobs/:id/complete`.
+6. **A durable outbox**: "child ended, tell the parent" happens in memory; a crash at the wrong moment is only repaired when the parent resumes. Store these notifications in a table instead.
+7. **More than one engine node**: every running instance lives in one Node.js process. Running two nodes needs a lease per instance (who runs it) and optimistic locking on the row.
 
-### Supported subset
+### Supported elements
+
+bpmn-engine supports most of BPMN 2.0 ([bpmn-elements](https://github.com/paed01/bpmn-elements)). The sample diagrams use:
 
 Events: plain `startEvent`; `endEvent` (plain, terminate, error); timer and message `intermediateCatchEvent`;
-compensation `intermediateThrowEvent`; error, compensation, timer and message `boundaryEvent` (timer and message
-boundaries interrupting or not, on activities that wait).
+compensation `intermediateThrowEvent`; error, compensation, timer and message `boundaryEvent` (interrupting or not).
 Activities: `task`, `serviceTask`, `userTask`, `receiveTask`, embedded `subProcess`, `callActivity`, each optionally
 multi-instance (parallel or sequential).
 Gateways: `exclusiveGateway`, `parallelGateway`, `eventBasedGateway`.
-Anything else (inclusive gateways, event sub-processes, script tasks, standard loops, message start events…) is refused
-at deploy time with a clear message rather than silently ignored.
+
+Deployment refuses `scriptTask`, `sendTask`, `businessRuleTask` (no `mini:handler` for them), `transaction`,
+`adHocSubProcess`, `complexGateway` and standard loops. Other elements bpmn-engine knows (inclusive gateways, event
+sub-processes, signal and escalation events, timer cycles) are accepted but not exercised by the samples.
 
 ### Extension attributes (`mini:` namespace)
 
@@ -276,11 +309,11 @@ at deploy time with a clear message rather than silently ignored.
 | `GET /api/processes/:key/xml?version=` | the BPMN of a version |
 | `GET /api/processes/:key/diff?from=&to=` | node-level diff between versions |
 | `POST /api/processes/:key/start` `{variables, version?, versionTag?}` | start an instance |
-| `POST /api/processes/:key/migrate` `{fromVersion, targetVersion, mapping?, dryRun?}` | batch migration |
 | `POST /api/messages` `{name, correlationKey?, variables?}` | correlate a message |
-| `GET /api/instances`, `GET /api/instances/:id` | list / detail (incl. user tasks, subscriptions, called instances) |
+| `GET /api/instances`, `GET /api/instances/:id` | list / detail (incl. tokens, user tasks, subscriptions, called instances) |
 | `POST /api/instances/:id/tasks/:tokenId/complete` `{variables}` | complete a user task |
 | `POST /api/instances/:id/incidents/:tokenId/retry` | retry an incident |
 | `PUT /api/instances/:id/variables` `{variables}` | replace variables |
-| `POST /api/instances/:id/migrate` `{targetVersion, mapping?, dryRun?}` | migrate one instance |
 | `POST /api/instances/:id/cancel` | cancel (also cancels the instances it called) |
+
+Token ids are bpmn-engine's execution ids (e.g. `Task_Approve_c485281a71`).

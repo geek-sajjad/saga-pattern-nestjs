@@ -6,8 +6,8 @@
      the goods are released, customs orders a physical inspection, or 30s pass (chase the broker, wait again);
    - a failed inspection ends with the error CARGO_SEIZED. Nothing in this process catches it, so it
      travels up to the call activity in import-shipment, which compensates every booking.
-  Node ids that mean the same thing are kept (Task_Declare, Task_Release, Timer_Chase), so migration
-  only needs one mapping: Wait_Release → Gw_Decision.
+  Node ids that mean the same thing are kept (Task_Declare, Task_Release, Timer_Chase), so the version diff
+  in the cockpit shows only what really changed.
 -->
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
                   xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"

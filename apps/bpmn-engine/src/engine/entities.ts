@@ -36,69 +36,54 @@ export class Deployment {
 }
 
 /**
- * Something a waiting token listens for. (Camunda: event subscriptions and timer jobs.)
- * A user task with a reminder timer and an "address changed" message boundary
- * has two subscriptions; whichever fires first decides what happens.
+ * Something an instance is busy with or waiting for, as bpmn-engine reported
+ * it through its events. bpmn-engine keeps the real execution state in its own
+ * snapshot (`engineState`); this list is our readable copy for the cockpit and
+ * for routing messages, user task completions and called instances back in.
  */
-export interface Subscription {
-  kind: 'timer' | 'message';
-  /** The event that fires: the catch event itself, a boundary event, or an event after an event-based gateway. */
-  eventId: string;
-  /** Timers: when to fire (epoch ms). */
-  dueAt?: number;
-  /** Messages: the name and the correlation key an incoming message must carry. */
+export interface Wait {
+  /** bpmn-engine's execution id. Signals go to it; the REST API calls it the token id. */
+  executionId: string;
+  nodeId: string;
+  /**
+   * executing → a handler runs right now (if we crash here, it runs again after the restart)
+   * user      → a user task waits for a person
+   * message   → a receive task, message catch event or message boundary event waits for a message
+   * timer     → a timer catch event or timer boundary event is set
+   * call      → a call activity waits for the instance it started
+   * join      → a parallel join waits for its other branches
+   */
+  kind: 'executing' | 'user' | 'message' | 'timer' | 'call' | 'join';
+  /** Multi-instance iteration: the execution id of the loop it belongs to, its index and item. */
+  scopeId?: string;
+  iteration?: { index: number; item: unknown };
+  /** Messages: the `<bpmn:message>` id to signal, its name, and the key an incoming message must carry. */
+  messageId?: string;
   messageName?: string;
   correlationKey?: string;
-  /** Boundary events only: does firing cancel the activity? */
+  /** Timers: when they fire (epoch ms). */
+  dueAt?: number;
+  /** Boundary events: does firing cancel the activity they sit on? */
   interrupting?: boolean;
+  /** Call activity: the instance it waits for. */
+  childInstanceId?: string;
 }
 
-/**
- * A token marks "where execution currently is". A process instance can have
- * several tokens at once (after a parallel gateway forks).
- *
- * Tokens form a tree through `scopeId`. A token that enters a sub-process
- * stays on the sub-process node (WAITING) and a child token starts inside it.
- * A multi-instance activity works the same way: the arriving token becomes
- * the "body" and one child token per item runs the activity.
- */
-export interface Token {
-  id: string;
+/** A technical failure the diagram doesn't model: the activity stays parked until an operator retries. */
+export interface Incident {
+  executionId: string;
   nodeId: string;
-  /** The sequence flow the token arrived through (a parallel join counts these). */
-  viaFlow?: string;
-  /**
-   * READY      → the engine should execute the node now
-   * EXECUTING  → a service task's handler is running (if we crash here, it re-runs on restart)
-   * WAITING    → a wait state: user/receive task, timer, message, join, sub-process, call activity, loop body
-   * INCIDENT   → a technical failure; needs a human to fix the cause and click "retry"
-   */
-  state: 'READY' | 'EXECUTING' | 'WAITING' | 'INCIDENT';
-  /** The token that owns this one's scope (a sub-process token or a multi-instance body). Unset = process level. */
-  scopeId?: string;
-  /** Variables only this token and its children see (a multi-instance item and its loopCounter). */
-  locals?: Record<string, any>;
-  /** Timers and messages this waiting token listens for. */
-  subscriptions?: Subscription[];
-  /** Multi-instance body: the items, and what each finished iteration produced. */
-  loop?: { items: unknown[]; started: number; finished: number; results: unknown[] };
-  /** Multi-instance iteration: which item this token works on. */
-  loopIndex?: number;
-  /** Call activity: the child process instance this token waits for. */
-  childInstanceId?: string;
-  /** @deprecated timers live in `subscriptions`; only read to upgrade instances saved by older versions. */
-  dueAt?: number;
-  incident?: string;
+  message: string;
+  at: string;
 }
 
 /** One line of the audit trail. (Camunda: the ACT_HI_* history tables.) */
 export interface HistoryEntry {
   at: string;
   type:
-    | 'instance-started' | 'node-entered' | 'node-completed' | 'flow-taken' | 'waiting'
-    | 'timer-fired' | 'message-received' | 'called' | 'loop-started'
-    | 'error-caught' | 'error-propagated' | 'incident' | 'incident-retried' | 'compensation-started' | 'compensated'
-    | 'variables-changed' | 'migrated'
+    | 'instance-started' | 'node-entered' | 'node-completed' | 'task-completed' | 'flow-taken' | 'waiting'
+    | 'timer-fired' | 'message-received' | 'called' | 'error-caught'
+    | 'incident' | 'incident-retried' | 'compensation-started' | 'compensated' | 'variables-changed'
     | 'instance-completed' | 'instance-terminated' | 'instance-cancelled';
   nodeId?: string;
   flowId?: string;
@@ -111,14 +96,12 @@ export interface CompletedActivity {
   at: string;
   /** Set once its compensation handler ran, so compensation never runs twice. */
   compensated?: boolean;
-  /** Multi-instance iterations: the item it worked on, so the undo knows WHICH one to undo. */
-  locals?: Record<string, any>;
 }
 
 /**
- * The runtime state of one execution of a process. The engine loads it,
- * moves tokens, and saves it after EVERY step, exactly like the saga log in
- * the orchestrator: the database row is the source of truth, not memory.
+ * One execution of a process. bpmn-engine runs it in memory; after every
+ * event the engine saves bpmn-engine's snapshot (`engineState`) together with
+ * our own bookkeeping, and on restart rebuilds the instance from that row.
  * (Camunda: ACT_RU_EXECUTION, ACT_RU_TASK, ACT_RU_VARIABLE, ACT_RU_JOB.)
  */
 @Entity('process_instances')
@@ -132,7 +115,7 @@ export class ProcessInstance {
   @Column()
   definitionVersion: number;
 
-  /** TERMINATED = ended by a BPMN error nobody inside caught; the error was handed to the parent process. */
+  /** TERMINATED = ended by an error nobody caught (for a called instance, the error goes to the calling process). */
   @Column({ type: 'varchar' })
   status: 'RUNNING' | 'COMPLETED' | 'CANCELLED' | 'TERMINATED';
 
@@ -140,16 +123,23 @@ export class ProcessInstance {
   @Column({ type: 'varchar', nullable: true })
   parentInstanceId: string | null;
 
-  /** The parent's call-activity token that waits for this instance. */
+  /** The execution id of the parent's call activity that waits for this instance. */
   @Column({ type: 'varchar', nullable: true })
-  parentTokenId: string | null;
+  parentExecutionId: string | null;
 
-  /** Why a TERMINATED instance ended: the error the parent's call activity has to deal with. */
+  /** Why a TERMINATED instance ended. */
   @Column({ type: 'simple-json', nullable: true })
   endError: { code: string; message: string } | null;
 
+  /** bpmn-engine's `getState()` snapshot: where every token is, timers, loop counters. Opaque to us. */
+  @Column({ type: 'simple-json', nullable: true })
+  engineState: object | null;
+
   @Column('simple-json')
-  tokens: Token[];
+  waits: Wait[];
+
+  @Column('simple-json')
+  incidents: Incident[];
 
   /** Process variables: the data that flows through the process. */
   @Column('simple-json')

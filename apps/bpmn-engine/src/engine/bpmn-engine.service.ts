@@ -1,64 +1,71 @@
 import { ConflictException, Injectable, Logger, NotFoundException, OnApplicationBootstrap, OnModuleDestroy } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
+import { Engine } from 'bpmn-engine';
 import { randomUUID } from 'crypto';
+import { EventEmitter } from 'events';
 import { Subject } from 'rxjs';
 import { Repository } from 'typeorm';
-import { parseBpmn } from './bpmn-parser';
-import { Deployment, HistoryEntry, ProcessInstance, Subscription, Token } from './entities';
-import { durationMs, evaluate } from './expressions';
+import { Deployment, HistoryEntry, Incident, ProcessInstance, Wait } from './entities';
+import { evaluate, libraryExpressions } from './expressions';
 import { BpmnError, HandlerRegistry } from './handlers';
-import { ACTIVITY_TYPES, FlowNode, ProcessDefinition } from './model';
+import { MINI_MODDLE } from './mini-moddle';
+import { ACTIVITY_TYPES, NodeInfo, ProcessModel, readProcessModel } from './process-model';
 
 export type EngineEvent = { type: 'instance'; instanceId: string } | { type: 'deployed'; key: string; version: number };
 
-export interface MigrationResult {
-  instanceId: string;
-  ok: boolean;
-  problems: string[];
+/** bpmn-engine's element API objects (what its events carry) are untyped JavaScript as far as we're concerned. */
+type ElementApi = any;
+
+/** An instance that bpmn-engine is executing right now, plus our bookkeeping around it. */
+interface LiveInstance {
+  record: ProcessInstance;
+  model: ProcessModel;
+  engine: Engine;
+  waits: Map<string, Wait>;
+  /** Call activities waiting for a child instance, by execution id. Used to signal them when the child ends. */
+  calls: Map<string, ElementApi>;
+  /** How to try a parked activity again (a failed handler, a failed compensation, a call that couldn't start). */
+  retries: Map<string, () => void>;
+  /** Handler calls in flight. Compensation waits for them: an interrupted call may still have booked something. */
+  inflight: Set<Promise<void>>;
+  /** Error codes caught by a boundary event; an error end event whose code isn't here was not caught. */
+  caughtErrors: string[];
+  /** An error end event nothing caught: bpmn-engine just ends the process, we end it as TERMINATED. */
+  uncaughtError?: { code: string; message: string };
+  /** True while bpmn-engine replays a restored snapshot: it re-emits waits and timers we already recorded. */
+  replaying: boolean;
+  ended: boolean;
+  dirty: boolean;
+  saving?: Promise<void>;
 }
 
-const shortId = () => randomUUID().slice(0, 8);
 const errorMessage = (err: unknown) => (err instanceof Error ? err.message : String(err));
 const pick = (vars: Record<string, any>, names: string[]) => Object.fromEntries(names.filter((n) => n in vars).map((n) => [n, vars[n]]));
 
-/** Wait states whose subscriptions can be rebuilt from the diagram alone, so migration may even change their type. */
-const EVENT_WAIT_TYPES = ['intermediateCatchEvent', 'receiveTask', 'eventBasedGateway'];
-
 /**
- * A minimal BPMN 2.0 process engine.
+ * The process engine, built on bpmn-engine (github.com/paed01/bpmn-engine).
  *
- * The whole engine is one idea: **token passing**. A process instance holds
- * one or more tokens; each token sits on a node of the graph. The engine
- * repeatedly picks a READY token and executes its node's behaviour:
+ * bpmn-engine executes BPMN 2.0: it walks tokens through the graph, evaluates
+ * gateways, runs timers, joins parallel branches, routes errors to boundary
+ * events and loops multi-instance activities. It does all of that in memory
+ * and tells us what happens through events.
  *
- *   start event / task       → move along the outgoing flow
- *   service task             → run the handler code, then move on
- *   user task, receive task,
- *   timer / message event    → park the token (WAITING) until a person / the clock / a message wakes it
- *   event-based gateway      → park the token on SEVERAL events at once; the first one to happen wins
- *   exclusive gateway (XOR)  → evaluate conditions, move along the first true flow
- *   parallel gateway (AND)   → fork: one token per outgoing flow
- *                              join: wait until a token arrived on every incoming flow
- *   sub-process              → park the token on the sub-process and start a child token inside it
- *   call activity            → park the token and start a separate instance of another process
- *   multi-instance activity  → park a "body" token and start one child token per list item
- *   end event                → consume the token; no tokens left = scope (or instance) completed
+ * This service is the "platform" around it, the part every product built on
+ * a BPMN library has to add itself:
  *
- * After every step the instance is saved, so a crash loses nothing.
+ *   deployments & versions   → Deployment table; each instance runs on the version it started with
+ *   persistence & restarts   → after every event, save bpmn-engine's snapshot; on boot, recover() + resume()
+ *   service tasks            → `mini:handler="ocean.book"` calls code from the HandlerRegistry
+ *   incidents                → a handler that fails technically parks its task until an operator retries
+ *   messages & correlation   → `POST /api/messages {name, correlationKey}` finds the waiting instance
+ *   call activities          → start a separate, separately versioned instance, and report back when it ends
+ *   compensation             → undo completed activities, newest first, one at a time
  */
 @Injectable()
 export class BpmnEngine implements OnApplicationBootstrap, OnModuleDestroy {
   private readonly log = new Logger('bpmn-engine');
-  private readonly definitions = new Map<string, ProcessDefinition>();
-  private readonly locks = new Map<string, Promise<unknown>>();
-  /**
-   * Work that must only start once an instance is saved: running a child
-   * instance, cancelling one, telling a parent that its child ended. It lives
-   * in memory, so a crash can lose it; resumeAfterRestart() reconciles that.
-   */
-  private readonly afterSave = new Map<string, (() => void)[]>();
-  private timerLoop?: NodeJS.Timeout;
-  private firingTimers = false;
+  private readonly models = new Map<string, ProcessModel>();
+  private readonly live = new Map<string, LiveInstance>();
   /** Observability only (the UI listens to it); the engine never depends on it. */
   readonly events = new Subject<EngineEvent>();
 
@@ -69,26 +76,35 @@ export class BpmnEngine implements OnApplicationBootstrap, OnModuleDestroy {
   ) {}
 
   async onApplicationBootstrap() {
-    await this.resumeAfterRestart();
-    // The "job executor": real engines poll a jobs table for due timers and async work.
-    this.timerLoop = setInterval(() => this.fireDueTimers().catch((e) => this.log.error(e)), 1000);
+    // Pick up every instance that was running when the process stopped.
+    for (const record of await this.instances.findBy({ status: 'RUNNING' })) {
+      try {
+        await this.resume(record);
+      } catch (err) {
+        this.log.error(`cannot resume instance ${record.id}: ${errorMessage(err)}`);
+      }
+    }
   }
 
-  onModuleDestroy() {
-    clearInterval(this.timerLoop);
+  async onModuleDestroy() {
+    // Stop timers and handlers; the saved snapshots let the next start continue where we left off.
+    for (const live of this.live.values()) {
+      live.ended = true;
+      await live.engine.stop();
+    }
   }
 
   // ───────────────────────────── deployment & versions ─────────────────────────────
 
   /** Validate and store a BPMN file. XML that is already deployed (as ANY version) creates no new version. */
   async deploy(xml: string): Promise<Deployment> {
-    const parsed = parseBpmn(xml); // throws BpmnValidationError with a list of problems
-    const same = await this.deployments.findOneBy({ key: parsed.key, xml });
+    const model = await readProcessModel(xml); // throws BpmnValidationError with a list of problems
+    const same = await this.deployments.findOneBy({ key: model.key, xml });
     if (same) return same;
 
-    const latest = await this.latestDeployment(parsed.key);
+    const latest = await this.latestDeployment(model.key);
     const deployment = await this.deployments.save(
-      this.deployments.create({ key: parsed.key, name: parsed.name, version: (latest?.version ?? 0) + 1, versionTag: parsed.versionTag ?? null, xml }),
+      this.deployments.create({ key: model.key, name: model.name, version: (latest?.version ?? 0) + 1, versionTag: model.versionTag ?? null, xml }),
     );
     this.log.log(`deployed ${deployment.key} v${deployment.version}${deployment.versionTag ? ` (${deployment.versionTag})` : ''}`);
     this.events.next({ type: 'deployed', key: deployment.key, version: deployment.version });
@@ -126,25 +142,25 @@ export class BpmnEngine implements OnApplicationBootstrap, OnModuleDestroy {
     return d;
   }
 
-  async definition(key: string, version: number): Promise<ProcessDefinition> {
+  async model(key: string, version: number): Promise<ProcessModel> {
     const cacheKey = `${key}@${version}`;
-    let def = this.definitions.get(cacheKey);
-    if (!def) {
-      def = parseBpmn((await this.getDeployment(key, version)).xml, version);
-      this.definitions.set(cacheKey, def);
+    let model = this.models.get(cacheKey);
+    if (!model) {
+      model = await readProcessModel((await this.getDeployment(key, version)).xml);
+      this.models.set(cacheKey, model);
     }
-    return def;
+    return model;
   }
 
-  /** What changed between two versions: the first question before migrating instances. */
+  /** What changed between two versions. */
   async diff(key: string, from: number, to: number) {
-    const [a, b] = [await this.definition(key, from), await this.definition(key, to)];
-    const describe = (n: FlowNode) => ({ id: n.id, type: n.type, name: n.name });
-    const differs = (x: FlowNode, y: FlowNode) => x.type !== y.type || x.name !== y.name || x.parentId !== y.parentId || x.handler !== y.handler || !!x.loop !== !!y.loop;
+    const [a, b] = [await this.model(key, from), await this.model(key, to)];
+    const describe = (n: NodeInfo) => ({ id: n.id, type: n.type, name: n.name });
+    const differs = (x: NodeInfo, y: NodeInfo) => x.type !== y.type || x.name !== y.name || x.parentId !== y.parentId || x.handler !== y.handler || !!x.loop !== !!y.loop;
     return {
       key,
       from: { version: from, versionTag: a.versionTag },
-      to: { version: to, versionTag: b.versionTag },
+    to: { version: to, versionTag: b.versionTag },
       added: Object.values(b.nodes).filter((n) => !a.nodes[n.id]).map(describe),
       removed: Object.values(a.nodes).filter((n) => !b.nodes[n.id]).map(describe),
       changed: Object.values(b.nodes).filter((n) => a.nodes[n.id] && differs(a.nodes[n.id], n)).map((n) => ({ from: describe(a.nodes[n.id]), to: describe(n) })),
@@ -160,81 +176,87 @@ export class BpmnEngine implements OnApplicationBootstrap, OnModuleDestroy {
   /**
    * Start an instance. By default the LATEST version, which is what callers
    * almost always want; pass a version or a version tag to pin an older one.
-   * Returns right away; execution continues in the background.
    */
   async start(key: string, variables: Record<string, unknown> = {}, pin: { version?: number; versionTag?: string } = {}): Promise<ProcessInstance> {
     const deployment = pin.versionTag ? await this.getDeploymentByTag(key, pin.versionTag) : await this.getDeployment(key, pin.version);
-    const instance = this.newInstance(await this.definition(key, deployment.version), variables);
-    await this.save(instance);
-    void this.run(instance.id);
-    return instance;
+    return this.startInstance(deployment, variables);
   }
 
-  /** A person finished a user task: merge the form data and move the token on. */
+  /** A person finished a user task: merge the form data and signal the task. */
   async completeUserTask(instanceId: string, tokenId: string, data: Record<string, unknown> = {}) {
-    await this.mutate(instanceId, (instance, def) => {
-      const token = this.findToken(instance, tokenId);
-      const node = def.nodes[token.nodeId];
-      if (node.type !== 'userTask' || token.state !== 'WAITING' || token.loop) throw new ConflictException(`token ${tokenId} is not waiting at a user task`);
-      this.writeVariables(instance, token, data);
-      this.completeActivity(instance, def, node, token, `completed by a user with ${JSON.stringify(data)}`);
-    });
+    const live = this.running(instanceId);
+    const wait = live.waits.get(tokenId);
+    if (wait?.kind !== 'user') throw new ConflictException(`token ${tokenId} is not waiting at a user task`);
+    const node = live.model.nodes[wait.nodeId];
+    let result: unknown = data;
+    if (wait.iteration) {
+      // One iteration of a multi-instance task: its result goes into the loop's output, not into the process variables.
+      const loop = node.loop!;
+      result = loop.outputElement ? evaluate(loop.outputElement, { ...live.record.variables, ...this.iterationLocals(node, wait.iteration), ...data }) : data;
+    } else {
+      Object.assign(live.record.variables, data);
+    }
+    live.waits.delete(tokenId);
+    this.record(live, { type: 'task-completed', nodeId: node.id, tokenId, message: `completed by a user with ${JSON.stringify(data)}` });
+    live.engine.execution!.signal({ id: node.id, executionId: tokenId, result });
+    this.persist(live);
   }
 
   /**
    * An external system tells the engine something happened ("vessel arrived").
-   * The engine delivers it to every instance with a matching subscription:
-   * same message name and, if the subscription has one, the same correlation key.
+   * The engine delivers it to every instance waiting for that message name
+   * and, if the wait has one, the same correlation key.
    * (Camunda 7: RuntimeService.createMessageCorrelation; Zeebe: PublishMessage.)
    * Unlike Zeebe we don't buffer: a message nobody waits for is dropped.
    */
   async correlateMessage(name: string, correlationKey?: string, variables: Record<string, unknown> = {}) {
-    const matches = (s: Subscription) =>
-      s.kind === 'message' && s.messageName === name && (correlationKey === undefined || s.correlationKey === undefined || s.correlationKey === String(correlationKey));
     const correlated: string[] = [];
-    for (const candidate of await this.instances.findBy({ status: 'RUNNING' })) {
-      if (!candidate.tokens.some((t) => t.state === 'WAITING' && t.subscriptions?.some(matches))) continue;
-      await this.mutate(candidate.id, (instance, def) => {
-        const token = instance.tokens.find((t) => t.state === 'WAITING' && t.subscriptions?.some(matches));
-        if (!token) return; // someone else got there first
-        this.fire(instance, def, token, token.subscriptions!.find(matches)!, variables);
-        correlated.push(instance.id);
-      }).catch((e) => this.log.warn(`message ${name} → ${candidate.id}: ${errorMessage(e)}`));
+    for (const live of [...this.live.values()]) {
+      const wait = [...live.waits.values()].find(
+        (w) => w.kind === 'message' && w.messageName === name && (correlationKey === undefined || w.correlationKey === undefined || w.correlationKey === String(correlationKey)),
+      );
+      if (!wait) continue;
+      Object.assign(live.record.variables, variables);
+      // bpmn-engine routes a signal carrying the <bpmn:message> id to whatever waits for that message.
+      live.engine.execution!.signal({ id: wait.messageId });
+      correlated.push(live.record.id);
+      this.persist(live);
     }
     return { name, correlationKey, correlated };
   }
 
-  /** An operator fixed the cause of an incident (e.g. restarted a service): try the node again. */
+  /** An operator fixed the cause of an incident (e.g. restarted a service): try the activity again. */
   async retryIncident(instanceId: string, tokenId: string) {
-    await this.mutate(instanceId, (instance) => {
-      const token = this.findToken(instance, tokenId);
-      if (token.state !== 'INCIDENT') throw new ConflictException(`token ${tokenId} has no incident`);
-      this.record(instance, { type: 'incident-retried', nodeId: token.nodeId, tokenId, message: 'retrying after incident' });
-      token.state = 'READY';
-      delete token.incident;
-    });
+    const live = this.running(instanceId);
+    const incident = live.record.incidents.find((i) => i.executionId === tokenId);
+    const retry = live.retries.get(tokenId);
+    if (!incident || !retry) throw new ConflictException(`token ${tokenId} has no incident`);
+    live.record.incidents = live.record.incidents.filter((i) => i !== incident);
+    this.record(live, { type: 'incident-retried', nodeId: incident.nodeId, tokenId, message: 'retrying after incident' });
+    retry();
+    this.persist(live);
   }
 
   /** Operators can fix data before a retry (e.g. correct a wrong address). Replaces the variables wholesale. */
   async setVariables(instanceId: string, variables: Record<string, unknown>) {
-    await this.mutate(instanceId, (instance) => {
-      instance.variables = variables;
-      this.record(instance, { type: 'variables-changed', message: 'variables edited by an operator' });
-    });
+    const live = this.running(instanceId);
+    // Replace the contents, not the object: expressions and handlers hold on to it.
+    for (const key of Object.keys(live.record.variables)) delete live.record.variables[key];
+    Object.assign(live.record.variables, variables);
+    this.record(live, { type: 'variables-changed', message: 'variables edited by an operator' });
+    this.persist(live);
   }
 
   /** Stop an instance and every instance it called. Nothing is compensated. */
   async cancel(instanceId: string, reason = 'cancelled by an operator') {
-    await this.mutate(instanceId, (instance) => {
-      this.removeTokens(instance, [...instance.tokens]);
-      instance.status = 'CANCELLED';
-      this.record(instance, { type: 'instance-cancelled', message: reason });
-      this.notifyParent(instance);
-    });
+    const live = this.running(instanceId);
+    live.ended = true;
+    await live.engine.stop();
+    await this.finish(live, 'CANCELLED', reason);
   }
 
-  listInstances() {
-    return this.instances.find({ order: { createdAt: 'DESC' }, take: 100 });
+  async listInstances() {
+    return (await this.instances.find({ order: { createdAt: 'DESC' }, take: 100 })).map((i) => this.live.get(i.id)?.record ?? i);
   }
 
   children(instanceId: string) {
@@ -242,788 +264,557 @@ export class BpmnEngine implements OnApplicationBootstrap, OnModuleDestroy {
   }
 
   async getInstance(id: string): Promise<ProcessInstance> {
+    const live = this.live.get(id);
+    if (live) return live.record;
     const instance = await this.instances.findOneBy({ id });
     if (!instance) throw new NotFoundException(`instance ${id} not found`);
     return instance;
   }
 
-  // ───────────────────────────── migration ─────────────────────────────
+  private running(instanceId: string): LiveInstance {
+    const live = this.live.get(instanceId);
+    if (!live || live.ended) throw new ConflictException(`instance ${instanceId} is not running`);
+    return live;
+  }
 
-  /**
-   * Move a RUNNING instance to another version of its process. Each token
-   * keeps its place: it moves to the node with the same id (or the id given
-   * in `mapping`) in the target version. Timers and messages are re-subscribed
-   * against the new diagram; a timer that exists in both keeps its due time.
-   * (Camunda 7: the migration API; Camunda 8: Operate's "migrate".)
-   */
-  async migrate(instanceId: string, targetVersion: number, mapping: Record<string, string> = {}, dryRun = false): Promise<MigrationResult> {
-    const result = await this.withLock(instanceId, async () => {
-      const instance = await this.getInstance(instanceId);
-      if (instance.status !== 'RUNNING') return { instanceId, ok: false, problems: [`instance is ${instance.status}`] };
-      const source = await this.definition(instance.definitionKey, instance.definitionVersion);
-      const target = await this.definition(instance.definitionKey, targetVersion);
-      if (source.version === target.version) return { instanceId, ok: false, problems: [`instance already runs on v${targetVersion}`] };
+  // ───────────────────────────── running instances on bpmn-engine ─────────────────────────────
 
-      const { problems, apply } = this.planMigration(instance, source, target, mapping);
-      if (problems.length || dryRun) return { instanceId, ok: !problems.length, problems };
-
-      apply();
-      instance.definitionVersion = target.version;
-      const mapped = Object.entries(mapping).map(([a, b]) => `${a}→${b}`).join(', ');
-      this.record(instance, { type: 'migrated', message: `migrated v${source.version} → v${target.version}${target.versionTag ? ` (${target.versionTag})` : ''}${mapped ? `, mapping ${mapped}` : ''}` });
-      await this.save(instance);
-      return { instanceId, ok: true, problems: [] };
+  private async startInstance(deployment: Deployment, variables: Record<string, unknown>, parent?: { instanceId: string; executionId: string }) {
+    const record = this.instances.create({
+      id: randomUUID(),
+      definitionKey: deployment.key,
+      definitionVersion: deployment.version,
+      status: 'RUNNING',
+      parentInstanceId: parent?.instanceId ?? null,
+      parentExecutionId: parent?.executionId ?? null,
+      endError: null,
+      engineState: null,
+      waits: [],
+      incidents: [],
+      variables,
+      completed: [],
+      history: [],
     });
-    if (result.ok && !dryRun) void this.run(instanceId);
-    return result;
+    const tag = deployment.versionTag ? ` (${deployment.versionTag})` : '';
+    this.pushHistory(record, { type: 'instance-started', message: `started ${deployment.name} v${deployment.version}${tag}${parent ? `, called by instance ${parent.instanceId.slice(0, 8)}` : ''}` });
+    await this.instances.save(record);
+
+    const live = this.createLive(record, await this.model(deployment.key, deployment.version), deployment.xml);
+    await live.engine.execute({ listener: this.listener(live) });
+    this.persist(live);
+    return record;
   }
 
-  /** Migrate every running instance of one version. Each instance succeeds or fails on its own. */
-  async migrateAll(key: string, fromVersion: number, toVersion: number, mapping: Record<string, string> = {}, dryRun = false) {
-    const running = await this.instances.findBy({ definitionKey: key, definitionVersion: fromVersion, status: 'RUNNING' });
-    const results: MigrationResult[] = [];
-    for (const instance of running) results.push(await this.migrate(instance.id, toVersion, mapping, dryRun));
-    return { key, fromVersion, toVersion, dryRun, migrated: results.filter((r) => r.ok).length, failed: results.filter((r) => !r.ok).length, results };
+  /** Rebuild a running instance from its saved snapshot. Its timers continue with the time they had left. */
+  private async resume(record: ProcessInstance) {
+    const deployment = await this.getDeployment(record.definitionKey, record.definitionVersion);
+    const live = this.createLive(record, await this.model(record.definitionKey, record.definitionVersion), deployment.xml);
+    live.replaying = true;
+    if (record.engineState) {
+      live.engine.recover(record.engineState as any);
+      await live.engine.resume({ listener: this.listener(live) });
+    } else {
+      // We crashed before the first snapshot was saved: start from the beginning.
+      await live.engine.execute({ listener: this.listener(live) });
+    }
+    live.replaying = false;
+    this.log.log(`resumed instance ${record.id}`);
+    this.persist(live);
   }
 
-  /** Check every token against the target version first; change nothing unless ALL of them fit. */
-  private planMigration(instance: ProcessInstance, source: ProcessDefinition, target: ProcessDefinition, mapping: Record<string, string>) {
-    const problems: string[] = [];
-    const changes: (() => void)[] = [];
-    const to = (id: string) => mapping[id] ?? id;
-    const v = `v${target.version}`;
+  /** One bpmn-engine Engine per instance, wired to our handlers, expressions and compensation. */
+  private createLive(record: ProcessInstance, model: ProcessModel, xml: string): LiveInstance {
+    const live = {
+      record,
+      model,
+      waits: new Map(record.waits.map((w) => [w.executionId, w])),
+      calls: new Map(),
+      retries: new Map(),
+      inflight: new Set(),
+      caughtErrors: [],
+      replaying: false,
+      ended: false,
+      dirty: false,
+    } as Omit<LiveInstance, 'engine'> as LiveInstance;
 
-    for (const token of instance.tokens) {
-      const from = source.nodes[token.nodeId];
-      const node = target.nodes[to(token.nodeId)];
-      const where = `token ${token.id} at "${from?.name ?? token.nodeId}"`;
-      if (!node) {
-        problems.push(`${where}: ${v} has no node "${to(token.nodeId)}"; map it to one that exists`);
-        continue;
-      }
-      if (token.state === 'EXECUTING') problems.push(`${where}: a handler is running right now; try again in a moment`);
-      const waiting = token.state === 'WAITING';
-      if (waiting && from.type !== node.type && !(EVENT_WAIT_TYPES.includes(from.type) && EVENT_WAIT_TYPES.includes(node.type))) {
-        problems.push(`${where}: it waits in a ${from.type}, but "${node.id}" is a ${node.type} in ${v}; only waiting events and receive tasks may change type`);
-      }
-      if ((token.loop || token.loopIndex !== undefined) && !node.loop) problems.push(`${where}: a multi-instance loop is running, but "${node.id}" is not multi-instance in ${v}`);
-      if (token.loopIndex === undefined) {
-        const scope = token.scopeId ? instance.tokens.find((t) => t.id === token.scopeId) : undefined;
-        if (node.parentId !== (scope ? to(scope.nodeId) : undefined)) problems.push(`${where}: "${node.id}" sits in a different sub-process in ${v}`);
-      }
-      if (waiting && node.type === 'parallelGateway' && token.viaFlow && !node.incoming.includes(token.viaFlow)) {
-        problems.push(`${where}: it waits at a join for flow ${token.viaFlow}, which does not enter "${node.id}" in ${v}`);
-      }
+    live.engine = new Engine({
+      name: record.id,
+      source: xml,
+      moddleOptions: { mini: MINI_MODDLE },
+      // `${…}` is JavaScript over the process variables (plus the item, inside a multi-instance iteration).
+      expressions: libraryExpressions((context) => ({ ...record.variables, ...this.localsOf(live, context?.content) })),
+      // Every service task runs its `mini:handler` through the HandlerRegistry.
+      extensions: {
+        mini: (activity: ElementApi) => {
+          if (activity.type === 'bpmn:ServiceTask') activity.behaviour.Service = this.handlerService(live);
+        },
+      },
+      // bpmn-elements' own compensation only reaches activities in the scope that throws it, and starts
+      // all undo tasks at once. We swap in ours: newest first, one at a time, an incident if an undo fails.
+      elements: { CompensateEventDefinition: this.compensationBehaviour(live) },
+    });
+    live.engine.once('end', () => void (live.uncaughtError ? this.finish(live, 'TERMINATED', undefined, live.uncaughtError) : this.finish(live, 'COMPLETED')));
+    live.engine.once('error', (err: any) => {
+      const code = err?.code ?? err?.inner?.code;
+      void this.finish(live, 'TERMINATED', undefined, { code: code ? String(code) : 'ERROR', message: err?.description ?? errorMessage(err) });
+    });
+    this.live.set(record.id, live);
+    return live;
+  }
 
-      let subscriptions = token.subscriptions;
-      if (waiting && node.type !== 'parallelGateway') {
+  /** bpmn-engine reports everything through a listener. This is where its events become our history and waits. */
+  private listener(live: LiveInstance) {
+    const listener = new EventEmitter();
+    listener.emit = (eventName: string | symbol, api: ElementApi) => {
+      if (!live.ended) {
         try {
-          subscriptions = this.subscriptionTargets(target, node, token).map((event) => {
-            const kept = token.subscriptions?.find((s) => to(s.eventId) === event.id && s.kind === (event.eventKind === 'timer' ? 'timer' : 'message'));
-            return kept ? { ...kept, eventId: event.id, interrupting: event.type === 'boundaryEvent' ? event.interrupting : undefined } : this.subscribe(instance, token, event);
-          });
+          this.onEngineEvent(live, String(eventName), api);
         } catch (err) {
-          problems.push(`${where}: cannot subscribe to the events of "${node.id}": ${errorMessage(err)}`);
+          this.log.error(`[${live.record.id.slice(0, 8)}] ${String(eventName)}: ${errorMessage(err)}`);
         }
       }
-      changes.push(() => {
-        token.nodeId = node.id;
-        token.subscriptions = subscriptions?.length ? subscriptions : undefined;
-      });
-    }
-
-    const apply = () => {
-      changes.forEach((change) => change());
-      // Keep the compensation log pointing at nodes that exist in the new version.
-      for (const done of instance.completed) if (target.nodes[to(done.nodeId)]) done.nodeId = to(done.nodeId);
+      return true;
     };
-    return { problems, apply };
+    return listener;
   }
 
-  // ───────────────────────────── the token loop ─────────────────────────────
+  private onEngineEvent(live: LiveInstance, eventName: string, api: ElementApi) {
+    const content = api.content ?? {};
+    const node = live.model.nodes[api.id];
+    const label = (id: string) => live.model.nodes[id]?.name ?? id;
+    const isIteration = content.isMultiInstance && !content.isRootScope;
 
-  /** Load the instance and execute READY tokens until every token waits or is gone. */
-  private run(instanceId: string): Promise<void> {
-    return this.withLock(instanceId, async () => {
-      const instance = await this.getInstance(instanceId);
-      const def = await this.definition(instance.definitionKey, instance.definitionVersion);
-
-      for (let steps = 0; instance.status === 'RUNNING'; steps++) {
-        const token = instance.tokens.find((t) => t.state === 'READY');
-        if (!token) break; // everything is waiting (user task, timer, message, join, incident) or done
-        if (steps > 1000) {
-          this.incident(instance, token, 'more than 1000 steps without a wait state; is there an endless loop?');
-        } else {
-          await this.execute(instance, def, token);
-        }
-        await this.save(instance);
+    switch (eventName) {
+      case 'flow.take': {
+        const flow = live.model.flows[api.id];
+        if (flow) this.record(live, { type: 'flow-taken', flowId: flow.id, message: `→ ${label(flow.targetRef)}${flow.name ? ` (${flow.name})` : ''}` });
+        break;
       }
-    }).catch((err) => this.log.error(`instance ${instanceId}: ${errorMessage(err)}`));
+
+      case 'activity.start':
+        // A parallel join is "entered" by its first branch, then waits for the others.
+        if (node?.type === 'parallelGateway' && node.incoming.length > 1) this.setWait(live, { executionId: api.executionId, nodeId: node.id, kind: 'join' });
+        break;
+
+      case 'activity.wait': {
+        if (!node) break;
+        const iteration = isIteration ? { index: content.index, item: content[node.loop!.elementVariable] } : undefined;
+        if (node.type === 'userTask') {
+          this.setWait(live, { executionId: api.executionId, nodeId: node.id, kind: 'user', scopeId: isIteration ? content.parent?.executionId : undefined, iteration });
+          this.record(live, { type: 'waiting', nodeId: node.id, tokenId: api.executionId, message: `waiting for a person to complete "${label(node.id)}"${iteration ? ` (item #${iteration.index + 1})` : ''}` });
+        } else if (node.message) {
+          this.subscribe(live, node, api.executionId);
+        }
+        break;
+      }
+
+      case 'activity.timer': {
+        // The timer runs on the event definition; the wait belongs to the event (its parent execution).
+        const executionId = content.parent?.executionId ?? api.executionId;
+        this.setWait(live, { executionId, nodeId: api.id, kind: 'timer', dueAt: new Date(content.expireAt).getTime(), interrupting: node?.interrupting });
+        this.record(live, { type: 'waiting', nodeId: api.id, tokenId: executionId, message: `timer set${content.timeout ? ` for ${content.timeout / 1000}s` : ''}${node?.attachedTo ? ` on "${label(node.attachedTo)}"` : ''}` });
+        break;
+      }
+
+      case 'activity.timeout':
+        this.record(live, { type: 'timer-fired', nodeId: api.id, message: `timer "${label(api.id)}" fired${node?.interrupting === false ? ' (non-interrupting)' : ''}` });
+        break;
+
+      case 'activity.throw':
+        // An error end event. bpmn-engine announces the catch (if any) before the throw.
+        if (content.message?.type === 'bpmn:Error') {
+          const code = String(content.message.code);
+          const caught = live.caughtErrors.indexOf(code);
+          if (caught >= 0) live.caughtErrors.splice(caught, 1);
+          else live.uncaughtError = { code, message: `end event "${label(api.id)}" threw ${code}` };
+        }
+        break;
+
+      case 'activity.catch':
+        if (content.error) {
+          if (content.error.code) {
+            // Only matters to an `activity.throw` that follows in the same tick (see above).
+            const code = String(content.error.code);
+            live.caughtErrors.push(code);
+            setImmediate(() => live.caughtErrors.includes(code) && live.caughtErrors.splice(live.caughtErrors.indexOf(code), 1));
+          }
+          // Handlers that undo things want to know why (`variables.lastError`).
+          live.record.variables.lastError = { code: content.error.code, message: content.error.message ?? content.error.description, nodeId: content.error.source?.content?.id };
+          this.record(live, { type: 'error-caught', nodeId: api.id, message: `"${label(node?.attachedTo ?? api.id)}" caught ${content.error.code ?? 'an error'}: ${content.error.message ?? content.error.description}` });
+        } else if (node?.message) {
+          this.record(live, { type: 'message-received', nodeId: api.id, message: `message "${node.message.name}" received` });
+        }
+        break;
+
+      case 'activity.call':
+        void this.onCallActivity(live, api);
+        break;
+
+      case 'activity.call.cancel': {
+        // The call activity was interrupted (boundary event, error, cancel): the child is no longer needed.
+        const childId = live.waits.get(api.executionId)?.childInstanceId;
+        if (childId) void this.cancel(childId, `cancelled because the calling instance ${live.record.id.slice(0, 8)} no longer needs it`).catch(() => undefined);
+        break;
+      }
+
+      case 'activity.end':
+        if (!node) break;
+        if (content.isRootScope && ACTIVITY_TYPES.includes(node.type) && !node.isForCompensation) {
+          live.record.completed.push({ nodeId: node.id, at: new Date().toISOString() });
+        }
+        if (content.isRootScope && node.loop?.outputCollection) {
+          // bpmn-engine collects one output per iteration; user task iterations carry theirs as `result`.
+          const outputs: unknown[] = content.output ?? [];
+          live.record.variables[node.loop.outputCollection] = outputs.map((o: any) => (node.type === 'userTask' ? o?.result : o));
+        }
+        this.removeWaits(live, api.executionId);
+        this.record(live, { type: 'node-completed', nodeId: node.id, tokenId: api.executionId, message: `${node.type} "${label(node.id)}" done` });
+        break;
+
+      case 'activity.leave':
+      case 'activity.discard':
+        this.removeWaits(live, api.executionId);
+        break;
+
+      default:
+        return; // nothing changed that we keep
+    }
+    this.persist(live);
   }
 
-  /** The behaviour of each BPMN element type. */
-  private async execute(instance: ProcessInstance, def: ProcessDefinition, token: Token): Promise<void> {
-    const node = def.nodes[token.nodeId];
+  /** A message wait: the correlation key is evaluated NOW, against the current variables. */
+  private subscribe(live: LiveInstance, node: NodeInfo, executionId: string) {
+    const { id, name, correlationKey } = node.message!;
+    let key: unknown;
+    try {
+      key = correlationKey ? evaluate(correlationKey, live.record.variables) : undefined;
+    } catch (err) {
+      this.log.warn(`[${live.record.id.slice(0, 8)}] correlation key ${correlationKey} of ${node.id}: ${errorMessage(err)}`);
+    }
+    this.setWait(live, { executionId, nodeId: node.id, kind: 'message', messageId: id, messageName: name, correlationKey: key == null ? undefined : String(key), interrupting: node.interrupting });
+    this.record(live, { type: 'waiting', nodeId: node.id, tokenId: executionId, message: `waiting for message "${name}"${key == null ? '' : ` with key ${key}`}` });
+  }
 
-    // A multi-instance activity: the arriving token becomes the loop body;
-    // its iterations (loopIndex set) run the activity itself.
-    if (node.loop && token.loopIndex === undefined) return this.startLoop(instance, def, node, token);
+  // ───────────────────────────── service tasks & incidents ─────────────────────────────
 
-    switch (node.type) {
-      case 'startEvent':
-      case 'boundaryEvent': // a caught error / fired timer or message: just continue along its flow
-        this.completeNode(instance, node, token);
-        return this.leave(instance, def, token, node.outgoing);
-
-      case 'task': // a task with no type does nothing; it's documentation
-        return this.completeActivity(instance, def, node, token);
-
-      case 'serviceTask':
-        return this.executeServiceTask(instance, def, node, token);
-
-      case 'userTask':
-        this.park(instance, def, node, token, `waiting for a person to complete "${node.name}"`);
-        return;
-
-      case 'receiveTask':
-      case 'intermediateCatchEvent':
-        this.park(instance, def, node, token, node.eventKind === 'timer' ? `timer set for ${node.timerDuration}` : `waiting for message "${node.message!.name}"`);
-        return;
-
-      case 'eventBasedGateway': {
-        const names = node.outgoing.map((f) => `"${def.nodes[def.flows[f].targetRef].name ?? def.flows[f].targetRef}"`).join(' or ');
-        this.park(instance, def, node, token, `racing ${names}: the first to happen wins`);
-        return;
+  /**
+   * The service behind every service task (bpmn-elements calls it with the
+   * task's execute message and a callback). The diagram says WHAT happens; the
+   * handler named in `mini:handler` says HOW.
+   */
+  private handlerService(live: LiveInstance) {
+    const engine = this;
+    return class HandlerService {
+      private executionId?: string;
+      constructor(private readonly activity: ElementApi) {}
+      execute(executeMessage: ElementApi, callback: (err: Error | null, output?: unknown) => void) {
+        this.executionId = executeMessage.content.executionId;
+        engine.runHandler(live, this.activity.id, executeMessage.content, callback);
       }
+      /** bpmn-elements discards a running task when something interrupts it; its handler may still be running. */
+      discard() {
+        if (this.executionId) engine.removeWaits(live, this.executionId);
+      }
+    };
+  }
 
-      case 'subProcess':
-        // The token stays on the sub-process (so its boundary events can fire) and a child token starts inside.
-        if (this.park(instance, def, node, token, `entered sub-process "${node.name ?? node.id}"`)) {
-          instance.tokens.push({ id: shortId(), nodeId: node.startNodeId!, state: 'READY', scopeId: token.id });
+  private runHandler(live: LiveInstance, nodeId: string, content: any, callback: (err: Error | null, output?: unknown) => void) {
+    const node = live.model.nodes[nodeId];
+    const executionId: string = content.executionId;
+    const isIteration = content.isMultiInstance && !content.isRootScope;
+    const attempt = () => {
+      live.retries.delete(executionId);
+      // Tracked until its outcome is booked, so compensation can wait for calls that are still out.
+      const run = call().catch((err) => this.log.error(`[${live.record.id.slice(0, 8)}] ${nodeId}: ${errorMessage(err)}`));
+      live.inflight.add(run);
+      void run.finally(() => live.inflight.delete(run));
+    };
+
+    const call = async () => {
+      const handler = this.handlers.get(node.handler ?? '');
+      if (!handler) return this.incident(live, executionId, node, `no handler registered for "${node.handler}"`, attempt);
+
+      this.setWait(live, { executionId, nodeId, kind: 'executing' });
+      this.record(live, { type: 'node-entered', nodeId, tokenId: executionId, message: `calling handler "${node.handler}"${isIteration ? ` for item #${content.index + 1}` : ''}` });
+      this.persist(live);
+
+      const locals = this.localsOf(live, content);
+      let result: Record<string, unknown> | void = undefined;
+      let failure: unknown = undefined;
+      try {
+        result = await handler({ instanceId: live.record.id, nodeId, variables: structuredClone({ ...live.record.variables, ...locals }) });
+      } catch (err) {
+        failure = err ?? new Error('handler failed');
+      }
+      // bpmn-elements expects the callback on a later tick (compensation and joins misbehave on synchronous completion).
+      // Decide what happened only then: the task may have been interrupted in the meantime.
+      await new Promise((resolve) => setImmediate(resolve));
+      if (live.ended) return;
+
+      if (!live.waits.has(executionId)) {
+        // The task was interrupted while its handler ran (an error in a parallel branch, an interrupting
+        // boundary event). If the work still happened, record it: compensation must undo it.
+        if (failure) return this.log.warn(`[${live.record.id.slice(0, 8)}] ${nodeId} failed after it was interrupted: ${errorMessage(failure)}`);
+        if (!isIteration) {
+          live.record.completed.push({ nodeId, at: new Date().toISOString() });
+          if (result) Object.assign(live.record.variables, result);
         }
-        return;
-
-      case 'callActivity':
-        return this.startCallActivity(instance, def, node, token);
-
-      case 'intermediateThrowEvent':
-        if (node.eventKind === 'compensate' && !(await this.compensate(instance, def, node, token))) return;
-        this.completeNode(instance, node, token);
-        return this.leave(instance, def, token, node.outgoing);
-
-      case 'exclusiveGateway': {
-        let chosen: string | undefined;
+        this.record(live, { type: 'node-completed', nodeId, tokenId: executionId, message: `handler "${node.handler}" finished after the task was interrupted; kept so compensation can undo it` });
+        return this.persist(live);
+      }
+      if (failure) {
+        // A business error: bpmn-engine routes it to the error boundary event whose errorCode matches.
+        if (failure instanceof BpmnError) return callback(Object.assign(new Error(failure.message), { code: failure.code }));
+        // Anything else is not modelled in the diagram: a technical problem for a human.
+        return this.incident(live, executionId, node, errorMessage(failure), attempt);
+      }
+      if (isIteration) {
+        // An iteration's result belongs to the loop (outputCollection), so parallel iterations don't overwrite each other.
+        let output: unknown;
         try {
-          chosen = this.chooseExclusiveFlow(def, node, this.scopeVariables(instance, token));
+          output = node.loop?.outputElement ? evaluate(node.loop.outputElement, { ...live.record.variables, ...locals, ...(result ?? {}) }) : (result ?? {});
         } catch (err) {
-          return this.incident(instance, token, `condition failed: ${errorMessage(err)}`);
+          return this.incident(live, executionId, node, `mini:outputElement ${node.loop?.outputElement} failed: ${errorMessage(err)}`, attempt);
         }
-        if (!chosen) return this.incident(instance, token, `no condition of "${node.name ?? node.id}" is true and there is no default flow`);
-        this.completeNode(instance, node, token);
-        return this.leave(instance, def, token, [chosen]);
+        return callback(null, output);
       }
+      if (result) Object.assign(live.record.variables, result);
+      callback(null, result ?? undefined);
+    };
 
-      case 'parallelGateway':
-        return this.executeParallelGateway(instance, def, node, token);
-
-      case 'endEvent':
-        return this.executeEndEvent(instance, def, node, token);
+    if (live.record.incidents.some((i) => i.executionId === executionId)) {
+      live.retries.set(executionId, attempt); // parked before a restart; it stays parked until someone retries
+    } else {
+      if (live.replaying) this.record(live, { type: 'incident-retried', nodeId, tokenId: executionId, message: 'engine restarted while this handler was running: executing it again (at-least-once)' });
+      void attempt();
     }
   }
 
-  private async executeServiceTask(instance: ProcessInstance, def: ProcessDefinition, node: FlowNode, token: Token) {
-    const handler = this.handlers.get(node.handler!);
-    if (!handler) return this.incident(instance, token, `no handler registered for "${node.handler}"`);
-
-    // Persist EXECUTING before calling out. If the engine dies during the call,
-    // resumeAfterRestart() runs the handler again: at-least-once, so handlers must be idempotent.
-    token.state = 'EXECUTING';
-    this.record(instance, { type: 'node-entered', nodeId: node.id, tokenId: token.id, message: `calling handler "${node.handler}"` });
-    await this.save(instance);
-
-    try {
-      const result = await handler({ instanceId: instance.id, nodeId: node.id, variables: structuredClone(this.scopeVariables(instance, token)) });
-      this.writeVariables(instance, token, result ?? undefined);
-      this.completeActivity(instance, def, node, token);
-    } catch (err) {
-      if (err instanceof BpmnError) return this.throwError(instance, def, token, err.code, err.message);
-      // Not modelled in the diagram: a technical problem for a human.
-      this.incident(instance, token, errorMessage(err));
-    }
+  private incident(live: LiveInstance, executionId: string, node: NodeInfo, message: string, retry: () => void) {
+    live.record.incidents = [...live.record.incidents.filter((i) => i.executionId !== executionId), { executionId, nodeId: node.id, message, at: new Date().toISOString() } satisfies Incident];
+    live.retries.set(executionId, retry);
+    this.record(live, { type: 'incident', nodeId: node.id, tokenId: executionId, message });
+    this.log.warn(`[${live.record.id.slice(0, 8)}] incident at ${node.id}: ${message}`);
+    this.persist(live);
   }
 
-  private chooseExclusiveFlow(def: ProcessDefinition, node: FlowNode, variables: Record<string, unknown>): string | undefined {
-    for (const flowId of node.outgoing) {
-      if (flowId === node.defaultFlow) continue;
-      const { condition } = def.flows[flowId];
-      if (!condition || evaluate(condition, variables)) return flowId; // first match wins, in diagram order
-    }
-    return node.defaultFlow;
-  }
-
-  private executeParallelGateway(instance: ProcessInstance, def: ProcessDefinition, node: FlowNode, token: Token) {
-    let continuing = token;
-
-    if (node.incoming.length > 1) {
-      // JOIN: park this token and check whether every incoming flow has delivered one (in the same scope).
-      token.state = 'WAITING';
-      const parked = instance.tokens.filter((t) => t.nodeId === node.id && t.state === 'WAITING' && t.scopeId === token.scopeId);
-      const arrivals = node.incoming.map((flowId) => parked.find((t) => t.viaFlow === flowId));
-      const arrived = arrivals.filter(Boolean).length;
-      if (arrived < node.incoming.length) {
-        this.record(instance, { type: 'waiting', nodeId: node.id, tokenId: token.id, message: `join: ${arrived}/${node.incoming.length} branches arrived` });
-        return;
-      }
-      // All branches are here: merge their tokens into one.
-      const consumed = arrivals as Token[];
-      instance.tokens = instance.tokens.filter((t) => !consumed.includes(t));
-      continuing = consumed[0];
-      instance.tokens.push(continuing);
-    }
-
-    // FORK (or a plain pass-through when there is a single outgoing flow).
-    this.completeNode(instance, node, continuing);
-    this.leave(instance, def, continuing, node.outgoing);
-  }
-
-  private executeEndEvent(instance: ProcessInstance, def: ProcessDefinition, node: FlowNode, token: Token) {
-    this.completeNode(instance, node, token);
-    if (node.eventKind === 'error') {
-      return this.throwError(instance, def, token, node.errorCode!, `end event "${node.name ?? node.id}" threw ${node.errorCode}`);
-    }
-    instance.tokens = instance.tokens.filter((t) => t !== token);
-    if (node.eventKind === 'terminate') {
-      // Terminate ends its own scope: the whole instance, or just the sub-process it sits in.
-      const doomed = token.scopeId ? this.descendants(instance, token.scopeId) : [...instance.tokens];
-      if (doomed.length) {
-        this.removeTokens(instance, doomed);
-        this.record(instance, { type: 'instance-terminated', nodeId: node.id, message: `terminate end event removed ${doomed.length} other token(s)${token.scopeId ? ' in its sub-process' : ''}` });
-      }
-    }
-    this.finishScopeIfEmpty(instance, def, token.scopeId, node);
-  }
-
-  /** The last token of a scope is gone: the sub-process completes, or the whole instance does. */
-  private finishScopeIfEmpty(instance: ProcessInstance, def: ProcessDefinition, scopeId: string | undefined, endNode: FlowNode) {
-    if (!scopeId) {
-      if (instance.tokens.length) return;
-      instance.status = 'COMPLETED';
-      this.record(instance, { type: 'instance-completed', nodeId: endNode.id, message: `completed at "${endNode.name ?? endNode.id}"` });
-      this.notifyParent(instance);
-      return;
-    }
-    if (instance.tokens.some((t) => t.scopeId === scopeId)) return;
-    const scopeToken = instance.tokens.find((t) => t.id === scopeId);
-    if (scopeToken) this.completeActivity(instance, def, def.nodes[scopeToken.nodeId], scopeToken, `sub-process finished at "${endNode.name ?? endNode.id}"`);
-  }
-
-  // ───────────────────────────── waiting: timers, messages, event-based gateways ─────────────────────────────
+  // ───────────────────────────── compensation ─────────────────────────────
 
   /**
-   * Park a token and subscribe to everything that may wake it: its own event
-   * (a timer or message catch event, a receive task, the events after an
-   * event-based gateway) and the timer/message boundary events of its activity.
+   * Replaces bpmn-elements' CompensateEventDefinition.
+   *  - On a compensation BOUNDARY event it does nothing, so the event simply
+   *    ends with its activity: we know what to undo from `completed`.
+   *  - On a compensation THROW event it runs the undo handlers and only then
+   *    lets the token continue.
    */
-  private park(instance: ProcessInstance, def: ProcessDefinition, node: FlowNode, token: Token, message: string): boolean {
-    try {
-      const subscriptions = this.subscriptionTargets(def, node, token).map((event) => this.subscribe(instance, token, event));
-      token.subscriptions = subscriptions.length ? subscriptions : undefined;
-    } catch (err) {
-      this.incident(instance, token, errorMessage(err));
-      return false;
-    }
-    token.state = 'WAITING';
-    this.record(instance, { type: 'waiting', nodeId: node.id, tokenId: token.id, message });
-    return true;
-  }
-
-  /** Which events a token waiting on `node` listens for. Shared by execution and migration. */
-  private subscriptionTargets(def: ProcessDefinition, node: FlowNode, token: Token): FlowNode[] {
-    const own =
-      token.loop ? [] // a loop body only listens to its boundary events
-      : node.type === 'eventBasedGateway' ? node.outgoing.map((f) => def.nodes[def.flows[f].targetRef])
-      : node.type === 'intermediateCatchEvent' || node.type === 'receiveTask' ? [node]
-      : [];
-    // Boundary events belong to the activity as a whole, so a loop's iterations don't subscribe; the body does.
-    const boundaries =
-      token.loopIndex !== undefined || !ACTIVITY_TYPES.includes(node.type) ? []
-      : node.boundaryEvents.map((id) => def.nodes[id]).filter((b) => b.eventKind === 'timer' || b.eventKind === 'message');
-    return [...own, ...boundaries];
-  }
-
-  private subscribe(instance: ProcessInstance, token: Token, event: FlowNode): Subscription {
-    const interrupting = event.type === 'boundaryEvent' ? event.interrupting : undefined;
-    if (event.eventKind === 'timer') return { kind: 'timer', eventId: event.id, dueAt: Date.now() + durationMs(event.timerDuration!), interrupting };
-    const { name, correlationKey } = event.message!;
-    // The key is evaluated NOW, against this token's variables: "wait for VesselArrived for shipment IMP-123".
-    const key = correlationKey ? evaluate(correlationKey, this.scopeVariables(instance, token)) : undefined;
-    return { kind: 'message', eventId: event.id, messageName: name, correlationKey: key == null ? undefined : String(key), interrupting };
-  }
-
-  /** A timer is due or a message arrived for a waiting token. */
-  private fire(instance: ProcessInstance, def: ProcessDefinition, token: Token, sub: Subscription, payload?: Record<string, unknown>) {
-    const event = def.nodes[sub.eventId];
-    const what = sub.kind === 'timer' ? `timer ${event.timerDuration} fired` : `message "${sub.messageName}" received`;
-    this.record(instance, { type: sub.kind === 'timer' ? 'timer-fired' : 'message-received', nodeId: event.id, tokenId: token.id, message: what });
-    if (payload && Object.keys(payload).length) this.writeVariables(instance, token, payload);
-
-    // 1. The token waits AT this event (catch event, receive task): it simply moves on.
-    if (event.id === token.nodeId) return this.completeActivity(instance, def, event, token, what);
-
-    // 2. The token waits at an event-based gateway: this event won the race, the others are dropped.
-    const here = def.nodes[token.nodeId];
-    if (here.type === 'eventBasedGateway') {
-      const flowId = here.outgoing.find((f) => def.flows[f].targetRef === event.id)!;
-      this.completeNode(instance, here, token, `"${event.name ?? event.id}" happened first`);
-      this.record(instance, { type: 'flow-taken', flowId, tokenId: token.id, message: `→ ${event.name ?? event.id}` });
-      token.nodeId = event.id;
-      token.viaFlow = flowId;
-      this.completeNode(instance, event, token, what);
-      return this.leave(instance, def, token, event.outgoing);
-    }
-
-    // 3. A boundary event of the activity the token waits in.
-    if (sub.interrupting) {
-      this.interrupt(instance, token); // cancels the activity, everything inside it, and any called instance
-      token.nodeId = event.id;
-      token.state = 'READY';
-      return;
-    }
-    // Non-interrupting: the activity keeps waiting and a NEW token runs the boundary path alongside it.
-    token.subscriptions = token.subscriptions?.filter((s) => s !== sub);
-    if (!token.subscriptions?.length) delete token.subscriptions;
-    instance.tokens.push({ id: shortId(), nodeId: event.id, state: 'READY', scopeId: token.scopeId });
-  }
-
-  // ───────────────────────────── multi-instance ─────────────────────────────
-
-  private startLoop(instance: ProcessInstance, def: ProcessDefinition, node: FlowNode, token: Token) {
-    const loop = node.loop!;
-    let items: unknown;
-    try {
-      items = evaluate(loop.collection, this.scopeVariables(instance, token));
-    } catch (err) {
-      return this.incident(instance, token, `multi-instance collection failed: ${errorMessage(err)}`);
-    }
-    if (!Array.isArray(items)) return this.incident(instance, token, `multi-instance collection ${loop.collection} is not a list`);
-
-    token.loop = { items, started: 0, finished: 0, results: [] };
-    const how = loop.sequential ? 'one after another' : 'in parallel';
-    if (!this.park(instance, def, node, token, `multi-instance: ${items.length} iteration(s) of "${node.name ?? node.id}", ${how}`)) {
-      delete token.loop;
-      return;
-    }
-    this.record(instance, { type: 'loop-started', nodeId: node.id, tokenId: token.id, message: `${items.length} × ${loop.elementVariable}, ${how}` });
-    if (!items.length) return this.finishLoop(instance, def, node, token);
-    for (let i = 0; i < (loop.sequential ? 1 : items.length); i++) this.startIteration(instance, node, token);
-  }
-
-  private startIteration(instance: ProcessInstance, node: FlowNode, body: Token) {
-    const i = body.loop!.started++;
-    instance.tokens.push({
-      id: shortId(),
-      nodeId: node.id,
-      state: 'READY',
-      scopeId: body.id,
-      loopIndex: i,
-      locals: { [node.loop!.elementVariable]: body.loop!.items[i], loopCounter: i },
-    });
-  }
-
-  private finishIteration(instance: ProcessInstance, def: ProcessDefinition, node: FlowNode, token: Token, result: unknown) {
-    const body = this.parentToken(instance, token)!;
-    instance.tokens = instance.tokens.filter((t) => t !== token);
-    body.loop!.results[token.loopIndex!] = result;
-    body.loop!.finished++;
-    if (node.loop!.sequential && body.loop!.started < body.loop!.items.length) return this.startIteration(instance, node, body);
-    if (body.loop!.finished === body.loop!.items.length) this.finishLoop(instance, def, node, body);
-  }
-
-  private finishLoop(instance: ProcessInstance, def: ProcessDefinition, node: FlowNode, body: Token) {
-    const { outputCollection } = node.loop!;
-    if (outputCollection) this.writeVariables(instance, body, { [outputCollection]: body.loop!.results });
-    this.completeNode(instance, node, body, `all ${body.loop!.items.length} iterations done${outputCollection ? `, collected into "${outputCollection}"` : ''}`);
-    this.leave(instance, def, body, node.outgoing);
-  }
-
-  // ───────────────────────────── call activities ─────────────────────────────
-
-  /**
-   * Start a separate instance of another process and wait for it. The child
-   * has its own tokens, variables, history and VERSION: which version is
-   * decided here, by the call activity's binding.
-   */
-  private async startCallActivity(instance: ProcessInstance, def: ProcessDefinition, node: FlowNode, token: Token) {
-    const vars = this.scopeVariables(instance, token);
-    let called: ProcessDefinition;
-    try {
-      const ref = node.calledVersion?.startsWith('${') ? String(evaluate(node.calledVersion, vars)) : node.calledVersion;
-      const deployment =
-        node.binding === 'versionTag' ? await this.getDeploymentByTag(node.calledElement!, ref!)
-        : await this.getDeployment(node.calledElement!, node.binding === 'version' ? Number(ref) : undefined);
-      called = await this.definition(deployment.key, deployment.version);
-    } catch (err) {
-      return this.incident(instance, token, `cannot call "${node.calledElement}": ${errorMessage(err)}`);
-    }
-
-    const child = this.newInstance(called, structuredClone(node.inputs ? pick(vars, node.inputs) : vars), { instanceId: instance.id, tokenId: token.id });
-    const label = `${called.key} v${called.version}${called.versionTag ? ` (${called.versionTag})` : ''}`;
-    if (!this.park(instance, def, node, token, `waiting for called instance ${child.id.slice(0, 8)} to finish`)) return;
-    token.childInstanceId = child.id;
-    this.record(instance, { type: 'called', nodeId: node.id, tokenId: token.id, message: `started ${label} as instance ${child.id.slice(0, 8)} (binding: ${node.binding}${node.calledVersion ? ` ${node.calledVersion}` : ''})` });
-    await this.save(child);
-    this.later(instance.id, () => void this.run(child.id));
-  }
-
-  /** A called instance completed, was terminated by an error, or was cancelled: continue the parent. */
-  private async onChildEnded(parentId: string, tokenId: string, childId: string) {
-    const child = await this.getInstance(childId);
-    if (child.status === 'RUNNING') return;
-    await this.mutate(parentId, (parent, def) => {
-      const token = parent.tokens.find((t) => t.id === tokenId && t.childInstanceId === childId);
-      if (!token || token.state !== 'WAITING') return; // delivered before (at-least-once), or the call was interrupted
-      const node = def.nodes[token.nodeId];
-      delete token.childInstanceId;
-      if (child.status === 'COMPLETED') {
-        this.writeVariables(parent, token, structuredClone(node.outputs ? pick(child.variables, node.outputs) : child.variables));
-        return this.completeActivity(parent, def, node, token, `called instance ${childId.slice(0, 8)} completed`);
+  private compensationBehaviour(live: LiveInstance) {
+    const engine = this;
+    return class Compensation {
+      readonly id: string;
+      constructor(private readonly activity: ElementApi, eventDefinition: ElementApi) {
+        this.id = activity.id;
+        (this as any).type = eventDefinition.type;
       }
-      if (child.status === 'TERMINATED' && child.endError) {
-        return this.throwError(parent, def, token, child.endError.code, `called process: ${child.endError.message}`);
+      execute(executeMessage: ElementApi) {
+        if (!this.activity.isThrowing) return;
+        const content = executeMessage.content;
+        engine.compensate(live, this.activity.id, content.parent?.executionId ?? content.executionId).then(
+          () => !live.ended && this.activity.broker.publish('execution', 'execute.completed', { ...content }),
+        );
       }
-      this.incident(parent, token, `called instance ${childId.slice(0, 8)} was cancelled; retry starts a new one`);
-    });
-  }
-
-  private notifyParent(instance: ProcessInstance) {
-    const { parentInstanceId, parentTokenId } = instance;
-    if (!parentInstanceId || !parentTokenId) return;
-    this.later(instance.id, () => void this.onChildEnded(parentInstanceId, parentTokenId, instance.id).catch((e) => this.log.warn(`notify parent ${parentInstanceId}: ${errorMessage(e)}`)));
-  }
-
-  // ───────────────────────────── errors and compensation ─────────────────────────────
-
-  /**
-   * A BPMN error travels OUTWARDS until something catches it: the activity's
-   * own error boundary, then the enclosing sub-process, then its parent… and
-   * finally the call activity in the calling process. The catching activity
-   * is interrupted: every token inside it is removed.
-   */
-  private throwError(instance: ProcessInstance, def: ProcessDefinition, token: Token, code: string, message: string) {
-    for (let t: Token | undefined = token; t; ) {
-      // An iteration of a loop throws on behalf of the whole loop: boundary events sit on the body.
-      const host = t.loopIndex !== undefined ? this.parentToken(instance, t)! : t;
-      const activity = def.nodes[host.nodeId];
-      const boundary = activity.boundaryEvents
-        .map((id) => def.nodes[id])
-        .find((b) => b.eventKind === 'error' && (!b.errorCode || b.errorCode === code));
-      if (boundary) {
-        instance.variables.lastError = { code, message, nodeId: token.nodeId };
-        this.record(instance, { type: 'error-caught', nodeId: boundary.id, tokenId: host.id, message: `"${activity.name ?? activity.id}" caught ${code}: ${message}` });
-        this.interrupt(instance, host);
-        host.nodeId = boundary.id;
-        host.state = 'READY';
-        delete host.incident;
-        return;
-      }
-      t = this.parentToken(instance, host);
-    }
-
-    if (instance.parentInstanceId) {
-      // Nobody in this instance catches it: end here and let the calling process deal with it.
-      this.record(instance, { type: 'error-propagated', nodeId: token.nodeId, tokenId: token.id, message: `nothing here catches ${code}; ending and handing it to the calling process` });
-      this.removeTokens(instance, [...instance.tokens]);
-      instance.status = 'TERMINATED';
-      instance.endError = { code, message };
-      this.notifyParent(instance);
-      return;
-    }
-    // Not modelled anywhere: a technical problem for a human.
-    this.incident(instance, token, `uncaught BPMN error ${code}: ${message}`);
+    };
   }
 
   /**
    * Compensation = BPMN's built-in saga. Walk the COMPLETED activities
    * backwards and run the compensation handler of each one that has one.
    * Activities that never completed (e.g. the one that just failed) are not
-   * compensated: there is nothing to undo.
+   * compensated: there is nothing to undo. Resolves once everything is undone.
    */
-  private async compensate(instance: ProcessInstance, def: ProcessDefinition, node: FlowNode, token: Token): Promise<boolean> {
-    const todo = [...instance.completed].reverse().filter((c) => !c.compensated && def.nodes[c.nodeId]?.compensatedBy);
-    this.record(instance, { type: 'compensation-started', nodeId: node.id, tokenId: token.id, message: `undoing ${todo.length} completed activit${todo.length === 1 ? 'y' : 'ies'} in reverse order` });
+  private compensate(live: LiveInstance, throwNodeId: string, executionId: string): Promise<void> {
+    const node = live.model.nodes[throwNodeId];
+    return new Promise((resolve) => {
+      const attempt = async () => {
+        live.retries.delete(executionId);
+        this.setWait(live, { executionId, nodeId: throwNodeId, kind: 'executing' });
+        // Parallel branches may still be calling out (bpmn-engine really runs them at the same time).
+        // Wait for them: what they book has to be undone too.
+        await Promise.all([...live.inflight]);
+        if (live.ended) return;
+        const todo = [...live.record.completed].reverse().filter((c) => !c.compensated && live.model.nodes[c.nodeId]?.compensatedBy);
+        this.record(live, { type: 'compensation-started', nodeId: throwNodeId, tokenId: executionId, message: `undoing ${todo.length} completed activit${todo.length === 1 ? 'y' : 'ies'} in reverse order` });
+        this.persist(live);
 
-    for (const done of todo) {
-      const undo = def.nodes[def.nodes[done.nodeId].compensatedBy!];
-      const handler = this.handlers.get(undo.handler ?? '');
-      if (!handler) {
-        this.incident(instance, token, `compensation task "${undo.name}" has no registered handler "${undo.handler}"`);
-        return false;
-      }
-      try {
-        const result = await handler({ instanceId: instance.id, nodeId: undo.id, variables: structuredClone({ ...instance.variables, ...done.locals }) });
-        if (result) Object.assign(instance.variables, result);
-      } catch (err) {
-        // A compensation must eventually succeed: stop here, an operator retries (already-undone steps are skipped).
-        this.incident(instance, token, `compensation "${undo.name}" failed: ${errorMessage(err)}`);
-        return false;
-      }
-      done.compensated = true;
-      this.record(instance, { type: 'compensated', nodeId: undo.id, message: `"${undo.name}" undid "${def.nodes[done.nodeId].name}"` });
-      await this.save(instance);
-    }
-    return true;
-  }
-
-  // ───────────────────────────── token helpers ─────────────────────────────
-
-  /**
-   * Move a token along the given flows. Several flows out of an activity mean
-   * an implicit parallel split: the token is cloned for every extra flow.
-   */
-  private leave(instance: ProcessInstance, def: ProcessDefinition, token: Token, flowIds: string[]) {
-    flowIds.forEach((flowId, i) => {
-      const t: Token = i === 0 ? token : { id: shortId(), nodeId: token.nodeId, state: 'READY', scopeId: token.scopeId };
-      if (i > 0) instance.tokens.push(t);
-      const flow = def.flows[flowId];
-      t.nodeId = flow.targetRef;
-      t.viaFlow = flow.id;
-      t.state = 'READY';
-      delete t.subscriptions;
-      delete t.loop;
-      delete t.childInstanceId;
-      delete t.dueAt;
-      this.record(instance, { type: 'flow-taken', flowId, tokenId: t.id, message: `→ ${def.nodes[flow.targetRef].name ?? flow.targetRef}${flow.name ? ` (${flow.name})` : ''}` });
+        for (const done of todo) {
+          const undo = live.model.nodes[live.model.nodes[done.nodeId].compensatedBy!];
+          const handler = this.handlers.get(undo.handler ?? '');
+          if (!handler) return this.incident(live, executionId, node, `compensation task "${undo.name}" has no registered handler "${undo.handler}"`, attempt);
+          try {
+            const result = await handler({ instanceId: live.record.id, nodeId: undo.id, variables: structuredClone(live.record.variables) });
+            if (live.ended) return;
+            if (result) Object.assign(live.record.variables, result);
+          } catch (err) {
+            if (live.ended) return;
+            // A compensation must eventually succeed: stop here, an operator retries (already-undone steps are skipped).
+            return this.incident(live, executionId, node, `compensation "${undo.name}" failed: ${errorMessage(err)}`, attempt);
+          }
+          done.compensated = true;
+          this.record(live, { type: 'compensated', nodeId: undo.id, message: `"${undo.name}" undid "${live.model.nodes[done.nodeId].name}"` });
+          this.persist(live);
+        }
+        this.removeWaits(live, executionId);
+        resolve();
+      };
+      if (live.record.incidents.some((i) => i.executionId === executionId)) live.retries.set(executionId, attempt);
+      else void attempt();
     });
   }
 
-  /** An activity is done: an iteration reports back to its loop, anything else moves on. */
-  private completeActivity(instance: ProcessInstance, def: ProcessDefinition, node: FlowNode, token: Token, message?: string) {
-    if (token.loopIndex === undefined) {
-      this.completeNode(instance, node, token, message);
-      return this.leave(instance, def, token, node.outgoing);
+  // ───────────────────────────── call activities ─────────────────────────────
+
+  /**
+   * bpmn-engine reached a call activity. It can only call processes from the
+   * same file, so it waits and leaves the rest to us: start a separate
+   * instance of the called process, in the version the binding picks.
+   */
+  private async onCallActivity(live: LiveInstance, api: ElementApi) {
+    const node = live.model.nodes[api.id];
+    const executionId: string = api.executionId;
+    live.calls.set(executionId, api);
+    this.setWait(live, { executionId, nodeId: node.id, kind: 'call' });
+
+    if (live.record.incidents.some((i) => i.executionId === executionId)) {
+      live.retries.set(executionId, () => void this.startChild(live, node, executionId));
+      return;
     }
-    const { elementVariable, outputElement } = node.loop!;
-    let result: unknown;
+    // After a restart bpmn-engine reaches the call activity again: reuse the child we started before.
+    const [existing] = await this.instances.find({ where: { parentInstanceId: live.record.id, parentExecutionId: executionId }, order: { createdAt: 'DESC' }, take: 1 });
+    if (existing) {
+      this.setWait(live, { executionId, nodeId: node.id, kind: 'call', childInstanceId: existing.id });
+      if (existing.status !== 'RUNNING') this.onChildEnded(live, this.live.get(existing.id)?.record ?? existing);
+      return;
+    }
+    await this.startChild(live, node, executionId);
+  }
+
+  private async startChild(live: LiveInstance, node: NodeInfo, executionId: string) {
+    const vars = live.record.variables;
+    const call = node.call!;
+    let deployment: Deployment;
     try {
-      const { [elementVariable]: _item, loopCounter: _i, ...produced } = token.locals ?? {};
-      result = outputElement ? evaluate(outputElement, this.scopeVariables(instance, token)) : produced;
+      const ref = call.calledVersion?.startsWith('${') ? String(evaluate(call.calledVersion, vars)) : call.calledVersion;
+      deployment =
+        call.binding === 'versionTag' ? await this.getDeploymentByTag(call.calledElement, ref!)
+        : await this.getDeployment(call.calledElement, call.binding === 'version' ? Number(ref) : undefined);
     } catch (err) {
-      return this.incident(instance, token, `outputElement ${outputElement} failed: ${errorMessage(err)}`);
+      return this.incident(live, executionId, node, `cannot call "${call.calledElement}": ${errorMessage(err)}`, () => void this.startChild(live, node, executionId));
     }
-    this.completeNode(instance, node, token, message);
-    this.finishIteration(instance, def, node, token, result);
+    const child = await this.startInstance(deployment, structuredClone(call.inputs ? pick(vars, call.inputs) : vars), { instanceId: live.record.id, executionId });
+    if (live.ended) return;
+    this.setWait(live, { executionId, nodeId: node.id, kind: 'call', childInstanceId: child.id });
+    const label = `${deployment.key} v${deployment.version}${deployment.versionTag ? ` (${deployment.versionTag})` : ''}`;
+    this.record(live, { type: 'called', nodeId: node.id, tokenId: executionId, message: `started ${label} as instance ${child.id.slice(0, 8)} (binding: ${call.binding}${call.calledVersion ? ` ${call.calledVersion}` : ''})` });
+    this.persist(live);
   }
 
-  private completeNode(instance: ProcessInstance, node: FlowNode, token: Token, message?: string) {
-    // The loop body isn't recorded: each iteration already was (and is compensated on its own).
-    if (ACTIVITY_TYPES.includes(node.type) && !token.loop) {
-      const locals = this.localVariables(instance, token);
-      instance.completed.push({ nodeId: node.id, at: new Date().toISOString(), ...(locals ? { locals } : {}) });
+  /** A called instance completed, was terminated by an error, or was cancelled: continue the parent. */
+  private onChildEnded(parent: LiveInstance, child: ProcessInstance) {
+    const executionId = child.parentExecutionId!;
+    const api = parent.calls.get(executionId);
+    if (!api || parent.ended) return; // the call was interrupted meanwhile
+    const node = parent.model.nodes[api.id];
+    const short = child.id.slice(0, 8);
+
+    if (child.status === 'COMPLETED') {
+      Object.assign(parent.record.variables, structuredClone(node.call!.outputs ? pick(child.variables, node.call!.outputs) : child.variables));
+      parent.calls.delete(executionId);
+      api.signal({});
+    } else if (child.status === 'TERMINATED' && child.endError) {
+      // The child's uncaught BPMN error lands on this call activity, where an error boundary can catch it.
+      parent.calls.delete(executionId);
+      api.sendApiMessage('error', { message: `called process: ${child.endError.message}`, code: child.endError.code });
+    } else {
+      this.incident(parent, executionId, node, `called instance ${short} was ${child.status.toLowerCase()}; retry starts a new one`, () => void this.startChild(parent, node, executionId));
     }
-    this.record(instance, { type: 'node-completed', nodeId: node.id, tokenId: token.id, message: message ?? `${node.type} "${node.name ?? node.id}" done` });
+    this.persist(parent);
   }
 
-  /** Cancel an activity in place: drop everything running inside it and stop listening to its events. */
-  private interrupt(instance: ProcessInstance, host: Token) {
-    this.removeTokens(instance, this.descendants(instance, host.id));
-    if (host.childInstanceId) this.cancelChildLater(instance, host.childInstanceId);
-    delete host.subscriptions;
-    delete host.loop;
-    delete host.childInstanceId;
-  }
+  // ───────────────────────────── bookkeeping ─────────────────────────────
 
-  private removeTokens(instance: ProcessInstance, doomed: Token[]) {
-    for (const t of doomed) if (t.childInstanceId) this.cancelChildLater(instance, t.childInstanceId);
-    instance.tokens = instance.tokens.filter((t) => !doomed.includes(t));
-  }
-
-  private cancelChildLater(instance: ProcessInstance, childId: string) {
-    this.later(instance.id, () => void this.cancel(childId, `cancelled because the calling instance ${instance.id.slice(0, 8)} no longer needs it`).catch(() => undefined));
-  }
-
-  /** Every token inside the scope of `scopeId`, at any depth. */
-  private descendants(instance: ProcessInstance, scopeId: string): Token[] {
-    const found: Token[] = [];
-    const queue = [scopeId];
-    while (queue.length) {
-      const id = queue.shift()!;
-      for (const t of instance.tokens.filter((x) => x.scopeId === id)) {
-        found.push(t);
-        queue.push(t.id);
-      }
+  /** The instance ended: COMPLETED (an end event), TERMINATED (an uncaught error) or CANCELLED (an operator). */
+  private async finish(live: LiveInstance, status: ProcessInstance['status'], reason?: string, endError?: { code: string; message: string }) {
+    if (live.record.status !== 'RUNNING') return;
+    live.ended = true;
+    const record = live.record;
+    record.status = status;
+    record.endError = endError ?? null;
+    live.waits.clear();
+    record.incidents = [];
+    if (status === 'COMPLETED') this.pushHistory(record, { type: 'instance-completed', message: 'completed' });
+    if (status === 'CANCELLED') this.pushHistory(record, { type: 'instance-cancelled', message: reason ?? 'cancelled' });
+    if (status === 'TERMINATED') {
+      const handedOver = record.parentInstanceId ? '; handing it to the calling process' : '';
+      this.pushHistory(record, { type: 'instance-terminated', message: `nothing caught ${endError?.code}: ${endError?.message}${handedOver}` });
+      this.log.warn(`[${record.id.slice(0, 8)}] terminated: ${endError?.code} ${endError?.message}`);
     }
-    return found;
-  }
+    this.persist(live);
+    await live.saving;
+    this.live.delete(record.id);
 
-  private parentToken(instance: ProcessInstance, token: Token): Token | undefined {
-    return token.scopeId ? instance.tokens.find((t) => t.id === token.scopeId) : undefined;
-  }
-
-  /** The token and its enclosing scopes, innermost first. */
-  private scopeChain(instance: ProcessInstance, token: Token): Token[] {
-    const chain: Token[] = [];
-    for (let t: Token | undefined = token; t; t = this.parentToken(instance, t)) chain.push(t);
-    return chain;
-  }
-
-  /** What code running at this token sees: process variables, overlaid with the locals of every enclosing loop iteration. */
-  private scopeVariables(instance: ProcessInstance, token: Token): Record<string, any> {
-    return Object.assign({}, instance.variables, this.localVariables(instance, token));
-  }
-
-  private localVariables(instance: ProcessInstance, token: Token): Record<string, any> | undefined {
-    const layers = this.scopeChain(instance, token).reverse().map((t) => t.locals).filter(Boolean);
-    return layers.length ? Object.assign({}, ...layers) : undefined;
-  }
-
-  /** Results land in the nearest loop iteration (so parallel iterations don't overwrite each other), else on the process. */
-  private writeVariables(instance: ProcessInstance, token: Token, data: Record<string, unknown> | undefined) {
-    if (!data) return;
-    const iteration = this.scopeChain(instance, token).find((t) => t.loopIndex !== undefined);
-    Object.assign(iteration ? (iteration.locals ??= {}) : instance.variables, data);
-  }
-
-  private newInstance(def: ProcessDefinition, variables: Record<string, unknown>, parent?: { instanceId: string; tokenId: string }) {
-    const instance = this.instances.create({
-      id: randomUUID(),
-      definitionKey: def.key,
-      definitionVersion: def.version,
-      status: 'RUNNING',
-      tokens: [{ id: shortId(), nodeId: def.startNodeId, state: 'READY' }],
-      variables,
-      completed: [],
-      history: [],
-      parentInstanceId: parent?.instanceId ?? null,
-      parentTokenId: parent?.tokenId ?? null,
-      endError: null,
-    });
-    const tag = def.versionTag ? ` (${def.versionTag})` : '';
-    this.record(instance, { type: 'instance-started', message: `started ${def.name} v${def.version}${tag}${parent ? `, called by instance ${parent.instanceId.slice(0, 8)}` : ''}` });
-    return instance;
-  }
-
-  private incident(instance: ProcessInstance, token: Token, message: string) {
-    token.state = 'INCIDENT';
-    token.incident = message;
-    this.record(instance, { type: 'incident', nodeId: token.nodeId, tokenId: token.id, message });
-    this.log.warn(`[${instance.id.slice(0, 8)}] incident at ${token.nodeId}: ${message}`);
-  }
-
-  private findToken(instance: ProcessInstance, tokenId: string): Token {
-    const token = instance.tokens.find((t) => t.id === tokenId);
-    if (!token) throw new NotFoundException(`token ${tokenId} not found in instance ${instance.id}`);
-    return token;
-  }
-
-  private record(instance: ProcessInstance, entry: Omit<HistoryEntry, 'at'>) {
-    instance.history.push({ at: new Date().toISOString(), ...entry });
-  }
-
-  private later(instanceId: string, fn: () => void) {
-    this.afterSave.set(instanceId, [...(this.afterSave.get(instanceId) ?? []), fn]);
-  }
-
-  private async save(instance: ProcessInstance) {
-    await this.instances.save(instance);
-    this.events.next({ type: 'instance', instanceId: instance.id });
-    const queued = this.afterSave.get(instance.id);
-    this.afterSave.delete(instance.id);
-    queued?.forEach((fn) => fn());
-  }
-
-  // ───────────────────────────── concurrency, timers, recovery ─────────────────────────────
-
-  /**
-   * Only one thing may change an instance at a time (a user completing a task
-   * while a timer fires, for example). Real engines use optimistic locking on
-   * a version column; a per-instance promise chain is enough for one process.
-   */
-  private withLock<T>(instanceId: string, fn: () => Promise<T>): Promise<T> {
-    const previous = this.locks.get(instanceId) ?? Promise.resolve();
-    const next = previous.catch(() => undefined).then(fn);
-    this.locks.set(instanceId, next);
-    next.finally(() => this.locks.get(instanceId) === next && this.locks.delete(instanceId)).catch(() => undefined);
-    return next;
-  }
-
-  /** Change an instance under the lock, save, then let the token loop continue in the background. */
-  private async mutate(instanceId: string, change: (instance: ProcessInstance, def: ProcessDefinition) => void) {
-    const instance = await this.withLock(instanceId, async () => {
-      const instance = await this.getInstance(instanceId);
-      if (instance.status !== 'RUNNING') throw new ConflictException(`instance ${instanceId} is ${instance.status}`);
-      change(instance, await this.definition(instance.definitionKey, instance.definitionVersion));
-      await this.save(instance);
-      return instance;
-    });
-    void this.run(instanceId);
-    return instance;
-  }
-
-  private async fireDueTimers() {
-    if (this.firingTimers) return; // the previous tick is still busy
-    this.firingTimers = true;
-    try {
-      await this.fireDueTimersNow();
-    } finally {
-      this.firingTimers = false;
+    // Called instances end with the instance that called them.
+    for (const child of await this.instances.findBy({ parentInstanceId: record.id, status: 'RUNNING' })) {
+      await this.cancel(child.id, `cancelled because the calling instance ${record.id.slice(0, 8)} ended`).catch(() => undefined);
     }
+    const parent = record.parentInstanceId ? this.live.get(record.parentInstanceId) : undefined;
+    if (parent) this.onChildEnded(parent, record);
   }
 
-  private async fireDueTimersNow() {
-    const now = Date.now();
-    const due = (t: Token) => t.state === 'WAITING' && !!t.subscriptions?.some((s) => s.kind === 'timer' && s.dueAt! <= now);
-    const running = await this.instances.findBy({ status: 'RUNNING' });
-    for (const instance of running) {
-      if (!instance.tokens.some(due)) continue;
-      await this.mutate(instance.id, (fresh, def) => {
-        for (const token of fresh.tokens.filter(due)) {
-          // Fire one timer per token per tick: an interrupting one may already have moved the token.
-          const sub = token.subscriptions!.find((s) => s.kind === 'timer' && s.dueAt! <= now)!;
-          if (fresh.tokens.includes(token) && token.state === 'WAITING') this.fire(fresh, def, token, sub);
-        }
-      }).catch((e) => this.log.error(e));
-    }
+  private setWait(live: LiveInstance, wait: Wait) {
+    const previous = live.waits.get(wait.executionId);
+    live.waits.set(wait.executionId, previous?.childInstanceId && !wait.childInstanceId ? { ...wait, childInstanceId: previous.childInstanceId } : wait);
   }
 
-  /** After a crash or restart, pick up every instance that still has work to do, and repair parent/child links. */
-  private async resumeAfterRestart() {
-    const running = await this.instances.findBy({ status: 'RUNNING' });
-    const followUps: (() => Promise<unknown>)[] = [];
+  /** An execution left: forget its wait, and those of any multi-instance iterations under it. */
+  removeWaits(live: LiveInstance, executionId: string) {
+    for (const [id, wait] of live.waits) if (id === executionId || wait.scopeId === executionId) live.waits.delete(id);
+  }
 
-    for (const instance of running) {
-      let changed = false;
-      for (const token of instance.tokens) {
-        // Upgrade timers saved by older versions of this engine.
-        if (token.dueAt && token.state === 'WAITING' && !token.subscriptions) {
-          token.subscriptions = [{ kind: 'timer', eventId: token.nodeId, dueAt: token.dueAt }];
-          delete token.dueAt;
-          changed = true;
-        }
-        if (token.state === 'EXECUTING') {
-          token.state = 'READY';
-          this.record(instance, { type: 'incident-retried', nodeId: token.nodeId, tokenId: token.id, message: 'engine restarted while this handler was running: executing it again (at-least-once)' });
-          changed = true;
-        }
-        // The child finished, but we crashed before hearing about it.
-        if (token.childInstanceId && token.state === 'WAITING') {
-          const child = await this.instances.findOneBy({ id: token.childInstanceId });
-          if (child && child.status !== 'RUNNING') followUps.push(() => this.onChildEnded(instance.id, token.id, child.id));
-        }
-      }
-      // A child whose parent no longer waits for it (we crashed between creating it and saving the parent).
-      if (instance.parentInstanceId) {
-        const parent = await this.instances.findOneBy({ id: instance.parentInstanceId });
-        if (!parent?.tokens.some((t) => t.childInstanceId === instance.id)) {
-          followUps.push(() => this.cancel(instance.id, 'orphaned: the calling instance does not wait for it'));
-          continue;
-        }
-      }
-      if (changed) await this.save(instance);
-      if (instance.tokens.some((t) => t.state === 'READY')) {
-        this.log.log(`resuming instance ${instance.id}`);
-        void this.run(instance.id);
-      }
+  /** Inside a multi-instance iteration, code also sees the item (`mini:elementVariable`) and `loopCounter`. */
+  private localsOf(live: LiveInstance, content: any): Record<string, unknown> {
+    if (!content?.isMultiInstance || content.isRootScope) return {};
+    const node = live.model.nodes[content.id];
+    return node?.loop ? this.iterationLocals(node, { index: content.index, item: content[node.loop.elementVariable] }) : {};
+  }
+
+  private iterationLocals(node: NodeInfo, iteration: { index: number; item: unknown }) {
+    return { [node.loop!.elementVariable]: iteration.item, loopCounter: iteration.index };
+  }
+
+  private record(live: LiveInstance, entry: Omit<HistoryEntry, 'at'>) {
+    // A restored instance re-announces its waits and timers; they are in the history already.
+    if (live.replaying && (entry.type === 'waiting' || entry.type === 'node-entered')) return;
+    this.pushHistory(live.record, entry);
+  }
+
+  private pushHistory(record: ProcessInstance, entry: Omit<HistoryEntry, 'at'>) {
+    record.history.push({ at: new Date().toISOString(), ...entry });
+  }
+
+  /** Save soon. Events come in bursts; one save covers all of them. */
+  private persist(live: LiveInstance) {
+    live.dirty = true;
+    live.saving ??= this.flush(live)
+      .catch((err) => this.log.error(`saving instance ${live.record.id}: ${errorMessage(err)}`))
+      .finally(() => (live.saving = undefined));
+  }
+
+  private async flush(live: LiveInstance) {
+    while (live.dirty) {
+      live.dirty = false;
+      live.record.engineState = (await live.engine.getState()) as object;
+      live.record.waits = [...live.waits.values()];
+      await this.instances.save(live.record);
+      this.events.next({ type: 'instance', instanceId: live.record.id });
     }
-    for (const followUp of followUps) await followUp().catch((e) => this.log.warn(errorMessage(e)));
   }
 }

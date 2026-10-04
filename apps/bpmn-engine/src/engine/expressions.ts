@@ -1,11 +1,13 @@
 /**
- * Conditions on sequence flows, e.g. `${quote.amount > 10000}`.
+ * Expressions such as `${quote.amount > 10000}` in conditions, `${containerList}`
+ * as a loop collection, or `${shipmentRef}` as a correlation key.
  *
  * Real engines use a dedicated, sandboxed expression language: JUEL in
- * Camunda 7, FEEL (from the DMN standard) in Camunda 8. Here the expression is
- * plain JavaScript with the process variables in scope. That's fine for
- * learning but NOT safe for untrusted diagrams: whoever deploys a diagram can
- * run code on the server.
+ * Camunda 7, FEEL (from the DMN standard) in Camunda 8. bpmn-engine's own
+ * default only resolves paths such as `${environment.variables.quote.amount}`,
+ * with no operators. Here the expression is plain JavaScript with the process
+ * variables in scope. That's fine for learning but NOT safe for untrusted
+ * diagrams: whoever deploys a diagram can run code on the server.
  */
 export function evaluate(expression: string, variables: Record<string, unknown>): unknown {
   const body = expression.trim().replace(/^\$\{([\s\S]*)\}$/, '$1');
@@ -14,10 +16,23 @@ export function evaluate(expression: string, variables: Record<string, unknown>)
   return fn(...names.map((k) => variables[k]));
 }
 
-/** ISO-8601 duration → milliseconds. Supports PnDTnHnMnS, e.g. PT10S, PT1M30S, P1D. */
-export function durationMs(iso: string): number {
-  const m = /^P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?)?$/.exec(iso.trim());
-  if (!m) throw new Error(`unsupported timer duration "${iso}" (use e.g. PT10S)`);
-  const [, d = 0, h = 0, min = 0, s = 0] = m;
-  return ((+d * 24 + +h) * 60 + +min) * 60_000 + +s * 1000;
+const WHOLE = /^\s*\$\{[\s\S]*\}\s*$/;
+
+/**
+ * The expressions handler bpmn-engine calls for every attribute that may hold
+ * an expression (conditions, loop collections, timer values, called element…).
+ * `scope` decides which variables an expression sees at that point.
+ */
+export function libraryExpressions(scope: (context: any) => Record<string, unknown>) {
+  return {
+    resolveExpression(expression: unknown, context: any = {}) {
+      if (typeof expression !== 'string' || !expression.includes('${')) return expression;
+      const variables = scope(context);
+      if (WHOLE.test(expression)) return evaluate(expression, variables);
+      // "Shipment ${shipmentRef} arrived": a string with expressions inside.
+      return expression.replace(/\$\{([^}]*)\}/g, (_, body) => String(evaluate(body, variables)));
+    },
+    isExpression: (text: unknown) => typeof text === 'string' && WHOLE.test(text),
+    hasExpression: (text: unknown) => typeof text === 'string' && text.includes('${'),
+  };
 }

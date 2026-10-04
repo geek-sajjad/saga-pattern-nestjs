@@ -4,7 +4,7 @@
   Submit the declaration, then wait for customs to release the goods. If customs stays silent,
   a NON-interrupting timer chases the broker while the receive task keeps waiting.
   Release 2026.2 (customs-clearance.v2.bpmn) replaces the receive task with an event-based gateway
-  and adds physical inspections; see the README for migrating running v1 instances to it.
+  and adds physical inspections. Instances started on 2026.1 finish on 2026.1.
 -->
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
                   xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
